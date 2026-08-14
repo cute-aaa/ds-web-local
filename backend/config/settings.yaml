@@ -1,0 +1,65 @@
+# 全局设置
+# 字符串值支持环境变量插值（仅整串匹配）：${VAR} 用环境变量替换；
+# ${VAR:-default} 变量未设置时用 default。例：port: ${DS_PORT:-8088}
+server:
+  host: 127.0.0.1
+  port: 8088
+  title: "DS Web Local"
+  description: "可插拔的本地 Agent 能力中台"
+  version: "3.0.0"
+
+logging:
+  level: INFO
+  file: logs/app.log
+  rotation: "10 MB"
+  retention: "30 days"
+  sensitive_keys: ["command", "arguments", "password", "token", "authorization", "api_key"]
+
+concurrency:
+  max_requests: 10
+  queue_timeout: 30
+
+health:
+  check_interval: 30
+  startup_wait: 3
+  retries: 3
+
+timeouts:
+  default: 120
+
+security:
+  auth_enabled: false
+  auth_token: ""
+  rate_limit: "60/minute"
+  # 工具审批：命中列表的工具调用先进入审批队列（POST /api/approvals），批准后前端重试
+  # 本地单机默认关闭；局域网/多端接入或对敏感操作可在设置中开启
+  approval_enabled: false
+  approval_required_tools: ["terminal_run"]
+
+# 网络工具（web_fetch / web_search）
+web:
+  # 搜索引擎 HTML 端点；支持 {query} 占位，或直接以 "?q=" 结尾（自动追加编码查询词）
+  search_url: "https://html.duckduckgo.com/html/?q="
+
+skills:
+  enabled: true
+  storage: config/skills.json
+  # SKILL.md 多根发现（相对 backend/ 或绝对路径均可），按优先级：bundled > user > custom
+  # 支持任意位置：网盘/共享盘/Git 仓库的 SKILL.md 库（source 标记为 custom）
+  skills_dirs: ["skills", "data/user-skills"]
+  # 只读导入源：D:/Hermes/skills（演示导入用，默认关闭；开启后可在控制台一键导入）
+  hermes_import_ro: true
+  hermes_import_dir: "D:/Hermes/skills"
+  # role_card 技能清单 description 截断长度
+  catalog_description_max_length: 500
+
+# 本地监听线程（0=关闭对应监听）
+watcher:
+  config_interval: 5    # mcp.json/settings.yaml 变更检测（秒）→ MCP 服务热重载
+  skills_interval: 5    # 技能目录变更检测（秒）→ catalog/digest 自动刷新
+
+# 可选双模式（Phase 11）：本地 LLM 后端
+llm:
+  base_url: https://api.deepseek.com
+  api_key: ""
+  model: deepseek-chat

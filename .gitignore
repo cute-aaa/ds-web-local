@@ -1,0 +1,31 @@
+# Node / frontend
+node_modules/
+dist/
+.vite/
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+.pytest_cache/
+.coverage
+htmlcov/
+
+# runtime
+*.db
+logs/
+data/
+*.log
+
+# secrets
+.env
+
+# misc
+.DS_Store
+.idea/
+.vscode/
+
+*.tsbuildinfo
+.pytest_cache/

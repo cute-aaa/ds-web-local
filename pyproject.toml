@@ -1,0 +1,24 @@
+[project]
+name = "ds-web-local"
+version = "3.0.0"
+description = "可插拔的本地 Agent 能力中台：网页版 DeepSeek / 本地 agent 复用同一套 MCP + 工具 + 技能"
+requires-python = ">=3.11"
+dependencies = [
+    "fastapi>=0.110",
+    "uvicorn[standard]>=0.27",
+    "mcp>=1.0.0",
+    "loguru>=0.7.2",
+    "pydantic>=2.5",
+    "pydantic-settings>=2.1",
+    "pyyaml>=6.0",
+    "httpx>=0.25",
+    "python-multipart>=0.0.6",
+    "slowapi>=0.1.9",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0", "pytest-asyncio>=0.23", "pytest-cov>=4.1"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["backend/tests"]
