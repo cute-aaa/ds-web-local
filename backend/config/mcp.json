@@ -1,0 +1,21 @@
+{
+  "services": {
+    "windows-mcp": {
+      "transport": "stdio",
+      "command": "uvx",
+      "args": [
+        "windows-mcp",
+        "serve"
+      ],
+      "auto_start": true,
+      "timeout": 120,
+      "description": "Windows 桌面自动化 MCP（窗口/点击/截图/注册表等）——需已安装 uv/uvx"
+    }
+  },
+  "server": {
+    "host": "127.0.0.1",
+    "port": 8088,
+    "title": "DS Web Local",
+    "version": "3.0.0"
+  }
+}

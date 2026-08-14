@@ -1,0 +1,51 @@
+name: CI
+
+on:
+  push:
+    branches: [master, main]
+  pull_request:
+
+jobs:
+  backend:
+    name: Backend tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install deps
+        run: pip install -r backend/requirements.txt pytest pytest-asyncio
+      - name: Run pytest
+        run: python -m pytest backend/tests -q
+      - name: Import check
+        run: python -c "import sys; sys.path.insert(0, 'backend'); from main import app; print('backend import OK')"
+
+  bridge:
+    name: Bridge selftest
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - name: Build user.js
+        run: python3 bridge/build.py
+      - name: Syntax check
+        run: node --check bridge/ds-bridge.user.js
+      - name: Selftest
+        run: node bridge/selftest.js
+
+  console:
+    name: Console build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - name: Install & build
+        working-directory: console
+        run: |
+          npm install
+          npm run build
