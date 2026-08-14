@@ -19,7 +19,7 @@ jobs:
       - name: Run pytest
         run: python -m pytest backend/tests -q
       - name: Import check
-        run: python -c "import sys; sys.path.insert(0, 'backend'); from main import app; print('backend import OK')"
+        run: python -c "import sys; sys.path.insert(0, 'backend'); from main import create_app; create_app(); print('backend import OK')"
 
   bridge:
     name: Bridge selftest
