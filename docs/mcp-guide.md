@@ -16,7 +16,7 @@
     "filesystem": {
       "transport": "stdio",
       "command": "npx",
-      "args": ["-y", "@modelcontextprotocol/server-filesystem", "C:/Users/I/Documents"],
+      "args": ["-y", "@modelcontextprotocol/server-filesystem", "C:/Users/YourName/Documents"],
       "auto_start": true,
       "description": "本地文件系统"
     },
