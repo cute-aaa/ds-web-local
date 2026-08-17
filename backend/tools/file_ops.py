@@ -9,6 +9,18 @@ from core.logger import get_logger
 logger = get_logger("tools.file_ops")
 
 
+def _is_external_result_file(path: str) -> bool:
+    """外置结果文件（data/tmp/result_*.json）？读取它时打 _external_source 标记，
+    外置分支跳过，避免 read_file → 外置 → read_file 死循环。"""
+    from core.config import DATA_DIR
+    try:
+        p = Path(path).resolve()
+        tmp = (DATA_DIR / "tmp").resolve()
+        return p.parent == tmp and p.name.startswith("result_") and p.name.endswith(".json")
+    except Exception:
+        return False
+
+
 async def search_replace(file_path: str, old_str: str, new_str: str, count: int = -1) -> Dict:
     """搜索替换。count=-1 全量，count=1 第一个（修复 v1 只替换第一个的问题）。"""
     try:
@@ -65,8 +77,10 @@ async def read_file(path: str, offset: int = 1, limit: int = 2000) -> Dict:
         truncated = len(content) > MAX_CONTENT
         if truncated:
             content = content[:MAX_CONTENT] + "\n...[内容已截断]"
+        external_source = {"_external_source": True} if _is_external_result_file(str(p)) else {}
         return {"path": str(p), "total_lines": total, "offset": start, "limit": limit,
-                "encoding": used_enc, "truncated": truncated, "content": content}
+                "encoding": used_enc, "truncated": truncated, "content": content,
+                **external_source}
     except Exception as e:
         return {"error": str(e)}
 
