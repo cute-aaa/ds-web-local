@@ -1,8 +1,10 @@
 # DS Web Local
 
+[![CI](https://github.com/cute-aaa/ds-web-local/actions/workflows/ci.yml/badge.svg)](https://github.com/cute-aaa/ds-web-local/actions/workflows/ci.yml)
+
 可插拔的本地 Agent 能力中台 —— 让【网页版 DeepSeek】获得本地 Agent 能力（MCP / 文件操作 / 技能 / 桌面自动化），也让本地 agent（Hermes / Claude Desktop）复用同一套工具。
 
-> ⚠️ 本项目调用 DeepSeek 网页版的能力是通过浏览器油猴脚本桥接实现，仅限个人学习研究使用。
+> ⚠️ **声明**：本项目仅供个人学习研究使用，不得用于商业用途。本项目通过浏览器油猴脚本桥接实现与 DeepSeek 网页版的交互，使用时请遵守 DeepSeek 官方服务条款。使用者需自行承担因使用本项目而产生的一切风险和责任。
 
 ## 特性
 
@@ -201,6 +203,39 @@ A: role_card 在新建对话时注入；后端配置（mcp.json/settings.yaml）
 
 **Q: 乱码？**
 A: 读文本文件请让模型用 read_file（自动检测 UTF-8/GBK）；PowerShell Get-Content 在中文 Windows 默认 GBK 会乱码。
+
+## 自定义角色卡（Role Card）
+
+角色卡（Role Card）是注入到 DeepSeek 对话中的系统规范，定义了模型可用的工具、调用格式和行为规则。
+
+### 修改方式
+
+编辑 `backend/rolecard/generator.py` 中的 `template` 字符串即可自定义角色卡内容：
+
+```python
+template = """# 系统规范（必须严格遵守）
+你是运行在本地环境的工作助理...
+...
+{tool_lines}
+
+{skills_section}"""
+```
+
+**可自定义内容：**
+- 系统提示语（角色定义、行为规范）
+- 工具调用格式说明
+- 通用规则（路径格式、错误处理、响应风格等）
+- 调用示例（新增/修改示例以引导模型行为）
+
+**动态内容（自动生成，无需手动修改）：**
+- `{tool_lines}` — 可用工具清单及参数提示
+- `{skills_section}` — 技能系统说明
+
+### 注意事项
+
+- 修改后需**重启后端**或**新建对话**才能生效
+- 角色卡内容会占用模型上下文，建议控制在合理长度
+- 示例对模型行为影响很大，添加示例是引导模型的有效方式
 
 ## 开发
 
