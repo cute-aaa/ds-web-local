@@ -87,7 +87,6 @@ def generate_role_card() -> str:
     lines.append("- 只输出最终结果和工具调用，禁止输出内部推理过程（如'我们收到用户请求'、'按照规范'、'我需要'等思考文本）")
     lines.append("- 响应简洁：直接给出结论或工具调用，不要解释'为什么这样做'或'我准备做什么'")
     lines.append("- 工具调用失败时，直接尝试正确方案，不要解释失败原因")
-    lines.append("")
     lines.append("## 通用规则（务必遵守）")
     lines.append("- Windows 路径：必须用正斜杠（G:/Download）或双反斜杠（G:\\\\Download），")
     lines.append("  禁止使用单反斜杠（G:\\Download 会破坏 JSON 格式导致解析失败）。")
