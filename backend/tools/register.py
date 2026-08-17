@@ -2,7 +2,7 @@
 from typing import Any
 
 from tools.registry import get_registry
-from tools import file_ops, search, git_ops, terminal_ops, todo, web_ops, jobs, ask_user
+from tools import file_ops, search, git_ops, terminal_ops, todo, web_ops, jobs, ask_user, system_ops
 
 
 async def _skill_tool(name: str = "") -> Any:
@@ -66,6 +66,16 @@ def register_all_builtin_tools() -> None:
     reg.register_builtin(
         "get_file_outline", file_ops.get_file_outline, "获取文件大纲（类/函数）",
         {"type": "object", "properties": {"file_path": {"type": "string"}}, "required": ["file_path"]})
+    reg.register_builtin(
+        "sed_replace", file_ops.sed_replace,
+        "正则替换文件内容（等价 sed 's/pattern/replacement/g'；count=-1 全量，1 首个）",
+        {"type": "object", "properties": {
+            "file_path": {"type": "string"}, "pattern": {"type": "string"},
+            "replacement": {"type": "string"},
+            "count": {"type": "integer", "default": -1},
+            "ignore_case": {"type": "boolean", "default": False},
+            "multiline": {"type": "boolean", "default": False}},
+         "required": ["file_path", "pattern", "replacement"]})
 
     # ---- 搜索 ----
     reg.register_builtin(
@@ -110,6 +120,59 @@ def register_all_builtin_tools() -> None:
     reg.register_builtin(
         "delete_terminal", terminal_ops.delete_terminal, "销毁终端",
         {"type": "object", "properties": {"session_id": {"type": "string"}}, "required": ["session_id"]})
+
+    # ---- 系统（环境变量 / 注册表 / 管理员运行）----
+    reg.register_builtin(
+        "env_get", system_ops.env_get, "读取环境变量（进程内值 + 用户级持久值）",
+        {"type": "object", "properties": {"name": {"type": "string"}}, "required": ["name"]})
+    reg.register_builtin(
+        "env_set", system_ops.env_set,
+        "设置环境变量（进程内立即生效；persistent=True 同时写入用户环境变量，新进程生效）",
+        {"type": "object", "properties": {
+            "name": {"type": "string"}, "value": {"type": "string"},
+            "persistent": {"type": "boolean", "default": True}},
+         "required": ["name", "value"]})
+    reg.register_builtin(
+        "env_delete", system_ops.env_delete, "删除环境变量（进程内 + 可选用户级持久值）",
+        {"type": "object", "properties": {
+            "name": {"type": "string"},
+            "persistent": {"type": "boolean", "default": True}},
+         "required": ["name"]})
+    reg.register_builtin(
+        "env_list", system_ops.env_list, "列出环境变量（敏感键脱敏，长值截断）",
+        {"type": "object", "properties": {}})
+    reg.register_builtin(
+        "registry_read", system_ops.registry_read,
+        "读取注册表值（path 如 HKCU\\Software\\Foo；name 为空返回默认值或子键列表）",
+        {"type": "object", "properties": {
+            "path": {"type": "string"}, "name": {"type": "string", "default": ""}},
+         "required": ["path"]})
+    reg.register_builtin(
+        "registry_list", system_ops.registry_list, "列出注册表键的子键和值",
+        {"type": "object", "properties": {"path": {"type": "string"}}, "required": ["path"]})
+    reg.register_builtin(
+        "registry_write", system_ops.registry_write,
+        "写入注册表值（type: REG_SZ/REG_EXPAND_SZ/REG_DWORD/REG_QWORD/REG_BINARY/REG_MULTI_SZ；create_key=True 自动建键）",
+        {"type": "object", "properties": {
+            "path": {"type": "string"}, "name": {"type": "string"},
+            "value": {"type": ["string", "integer", "number"]},
+            "type": {"type": "string", "default": "REG_SZ"},
+            "create_key": {"type": "boolean", "default": False}},
+         "required": ["path", "name", "value"]})
+    reg.register_builtin(
+        "registry_delete", system_ops.registry_delete, "删除注册表值（name 为空删除默认值）",
+        {"type": "object", "properties": {
+            "path": {"type": "string"}, "name": {"type": "string", "default": ""}},
+         "required": ["path"]})
+    reg.register_builtin(
+        "run_as_admin", system_ops.run_as_admin,
+        "以管理员权限运行程序/命令（触发 UAC 确认弹窗；wait=True 等待结束返回退出码）",
+        {"type": "object", "properties": {
+            "executable": {"type": "string"}, "args": {"type": "string", "default": ""},
+            "cwd": {"type": "string", "default": ""},
+            "wait": {"type": "boolean", "default": False},
+            "wait_timeout": {"type": "integer", "default": 120}},
+         "required": ["executable"]})
 
     # ---- 任务 ----
     reg.register_builtin(

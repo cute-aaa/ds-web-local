@@ -171,6 +171,41 @@ async def line_edit(file_path: str, edits: str) -> Dict:
         return {"error": str(e)}
 
 
+async def sed_replace(file_path: str, pattern: str, replacement: str,
+                      count: int = -1, ignore_case: bool = False,
+                      multiline: bool = False) -> Dict:
+    """正则替换文件内容（等价 sed 's/pattern/replacement/g'；count=-1 全量，1 首个）。
+
+    注意 replacement 中的 \\1 等反向引用需写作 \\\\1（JSON 转义后为 \\1）。
+    """
+    try:
+        p = Path(file_path)
+        if not p.exists():
+            return {"error": f"File not found: {file_path}"}
+        if not pattern:
+            return {"error": "pattern 不能为空"}
+        content = p.read_text(encoding="utf-8", errors="replace")
+        flags = 0
+        if ignore_case:
+            flags |= re.IGNORECASE
+        if multiline:
+            flags |= re.MULTILINE
+        try:
+            new_content, n = re.subn(pattern, replacement, content,
+                                     count=count if count >= 0 else 0, flags=flags)
+        except re.error as e:
+            return {"error": f"正则表达式无效: {e}"}
+        if n == 0:
+            return {"file_path": str(p), "status": "success", "replacements": 0,
+                    "pattern": pattern, "note": "未匹配到任何内容"}
+        p.write_text(new_content, encoding="utf-8")
+        return {"file_path": str(p), "status": "success", "replacements": n,
+                "pattern": pattern, "replacement": replacement, "count": count,
+                "note": f"已替换 {n} 处"}
+    except Exception as e:
+        return {"error": str(e)}
+
+
 async def get_file_outline(file_path: str) -> Dict:
     """获取文件大纲（类/函数列表）。Python 用 AST，其他用正则。"""
     try:
