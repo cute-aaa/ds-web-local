@@ -298,26 +298,6 @@
       return this.injectRolecard(rolecard, true);
     },
 
-    // 自动发送：点击发送按钮并验证输入框清空（占位符消失=成功），失败键盘兜底
-    async autoSend() {
-      const input = this._findInput();
-      if (!input) return false;
-      const send = this._findSend();
-      if (send) {
-        send.click();
-        await new Promise(r => setTimeout(r, 700));
-        const v = this._inputValue(input);
-        if (!v || !v.trim() || v === this.PLACEHOLDER) return true;  // 已发送
-        console.warn('[bridge] 自动发送点击后未清空，键盘兜底');
-      }
-      input.focus();
-      input.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', ctrlKey: true, bubbles: true }));
-      await new Promise(r => setTimeout(r, 300));
-      input.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true }));
-      await new Promise(r => setTimeout(r, 600));
-      return true;
-    },
-
     async injectRolecard(rolecard, force) {
       if (!rolecard) return false;
       try {
@@ -363,37 +343,22 @@
       }
     },
 
-    async sendMessage(text) {
-      const input = this._findInput();
-      if (!input) return false;
-      this._setInput(input, text);
-      await new Promise(r => setTimeout(r, 400));  // 等 React onChange 生效
-      const send = this._findSend();
-      if (send) {
-        send.click();
-        // 验证发送成功：输入框应被清空
-        await new Promise(r => setTimeout(r, 600));
-        const v = this._inputValue(input);
-        if (!v || !v.trim()) return true;  // 已清空 = 发送成功
-        console.warn('[bridge] 点击发送后输入框未清空，尝试键盘兜底');
-      }
-      // 键盘兜底（Ctrl+Enter 与 Enter 都试）
-      input.focus();
-      input.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', ctrlKey: true, bubbles: true }));
-      await new Promise(r => setTimeout(r, 300));
-      input.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true }));
-      await new Promise(r => setTimeout(r, 600));
-      return true;
-    },
 
     // 回填工具结果：直接填入真实结果文本（不依赖占位符+请求体替换——
     // 该机制依赖 DeepSeek 接口结构，页面更新即失效；直接回填最可靠）
     async fillInput(text) {
-      const MAX = 30000;
+      const MAX = 60000;  // 60KB：外置结果补全后完整内容可达 ~50KB（read_file 截断上限），须容下
       let display = String(text || '');
       if (display.length > MAX) display = display.slice(0, MAX) + '\n...[结果已截断，如需完整内容请分段查询]';
       const input = this._findInput();
       if (!input) return false;
+      // 输入框已有未发送的工具结果 → 追加而不是覆盖（防止多批回填互相覆盖丢失结果；
+      // 仅当输入框内容含工具结果标记时才追加，不碰用户手动输入的草稿）
+      const cur = this._inputValue(input);
+      if (cur && cur.trim() && /\[工具\d+执行结果\]/.test(cur)) {
+        display = cur + '\n\n' + display;
+        if (display.length > MAX) display = display.slice(0, MAX) + '\n...[结果已截断，如需完整内容请分段查询]';
+      }
       this._setInput(input, display);
       input.focus();
       // 高亮输入框提示用户按发送（10 秒）
@@ -561,11 +526,17 @@
       } catch (e) {}
 
       // 通道 3：DOM 观察兜底（仅检测，不保存——流式中间文本会重复触发）
+      // 文本指纹：内容未变化时跳过，避免每次字符更新都全量 querySelectorAll + 正则；
+      // 指纹带 30s 时间桶，同一文本 30 秒后重新检测（不遗漏长时间后的相同消息）
+      let lastTextKey = null;
       const observer = new MutationObserver(() => {
         const msgs = document.querySelectorAll('[class*="message"], [class*="markdown"], .ds-markdown');
         if (!msgs.length) return;
         const last = msgs[msgs.length - 1];
         const text = (last.textContent || '').trim();
+        const key = Math.floor(Date.now() / 30000) + ':' + text.length + ':' + text.slice(-300);
+        if (key === lastTextKey) return;
+        lastTextKey = key;
         if (text) detect(text);
       });
       observer.observe(document.body, { childList: true, subtree: true, characterData: true });

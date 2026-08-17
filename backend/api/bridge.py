@@ -1,5 +1,6 @@
 """桥接 API（契约 A）：web 端接入本地能力。"""
 import json
+import re
 import time
 import uuid
 from typing import Any, Dict, List, Optional
@@ -158,7 +159,16 @@ async def call(body: BridgeCallBody):
 
     if body.calls:
         for c in body.calls:
-            results.append(await _run_tracked(c.get("name", ""), c.get("arguments", {}), _run))
+            try:
+                results.append(await _run_tracked(c.get("name", ""), c.get("arguments", {}), _run))
+            except Exception as e:
+                # 单工具失败不中断整批：错误作为结果返回，模型能看到失败详情并针对性重试
+                # （审批 ApprovalRequired 是返回 dict 而非抛异常，不受影响）
+                results.append({
+                    "tool": c.get("name", ""),
+                    "status": "error",
+                    "error": f"{type(e).__name__}: {e}",
+                })
     elif body.tool:
         results.append(await _run_tracked(body.tool, body.arguments, _run))
     else:
@@ -167,7 +177,9 @@ async def call(body: BridgeCallBody):
     externalized = 0
     for i, r in enumerate(results):
         s = json.dumps(r, ensure_ascii=False)
-        if len(s) > MAX_INLINE_RESULT:
+        # 跳过已外置来源（read_file 读外置文件带 _external_source 标记）——
+        # 否则模型读外置文件的结果又 >20KB 再外置 → read_file → 外置 死循环
+        if len(s) > MAX_INLINE_RESULT and not (isinstance(r, dict) and r.get("_external_source")):
             path = _externalize_result(r)
             results[i] = {
                 "externalized": True,
@@ -178,7 +190,7 @@ async def call(body: BridgeCallBody):
             }
             externalized += 1
     if externalized:
-        log.info(f"{externalized}/{len(results)} 个结果超长已外置到 data/tmp")
+        logger.info(f"{externalized}/{len(results)} 个结果超长已外置到 data/tmp")
     return {"results": results}
 
 
@@ -217,6 +229,23 @@ async def _run_tracked(name: str, arguments: Dict, runner) -> Dict:
 async def tool_logs(limit: int = 50):
     """最近工具调用日志（控制台「工具日志」页）。"""
     return {"logs": list(_tool_logs)[-min(max(limit, 1), TOOL_LOG_MAX):]}
+
+
+@router.get("/files/{name}")
+async def get_external_file(name: str):
+    """返回外置结果文件（data/tmp/result_*.json）的完整内容。
+
+    供前端把超长结果自动内联回填给模型（"伪附件"）：模型无需再调 read_file
+    读外置文件，减少一轮往返，也避免 read_file → 外置 → read_file 死循环。
+    只允许 result_<12位hex>.json，防目录穿越。
+    """
+    if not re.fullmatch(r"result_[0-9a-f]{12}\.json", name):
+        raise ApiError(ErrorCode.NOT_FOUND, "文件不存在", 404)
+    from core.config import DATA_DIR
+    path = DATA_DIR / "tmp" / name
+    if not path.is_file():
+        raise ApiError(ErrorCode.NOT_FOUND, "文件不存在", 404)
+    return {"name": name, "content": path.read_text(encoding="utf-8")}
 
 
 @router.post("/session")

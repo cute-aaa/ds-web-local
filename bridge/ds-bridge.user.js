@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         DS Web Local Bridge
 // @namespace    ds-web-local
-// @version      3.0.0
+// @version      3.2.0
 // @description  网页版 DeepSeek 桥接本地 Agent 能力（MCP/文件/技能），自动注入 role_card + 解析工具调用
 // @match        https://chat.deepseek.com/*
 // @match        https://*.deepseek.com/*
@@ -24,7 +24,7 @@
   const BridgeCore = {
     config: {
       backendUrl: 'http://localhost:8088',
-      autoInject: true,
+      autoInject: true,  // 新建对话时自动注入上下文
       autoSend: false,   // 工具结果就绪后自动点击发送（默认关——可能触发 DeepSeek 风控，可手动开）
       rolecard: '',
       tools: [],
@@ -591,26 +591,6 @@
       return this.injectRolecard(rolecard, true);
     },
 
-    // 自动发送：点击发送按钮并验证输入框清空（占位符消失=成功），失败键盘兜底
-    async autoSend() {
-      const input = this._findInput();
-      if (!input) return false;
-      const send = this._findSend();
-      if (send) {
-        send.click();
-        await new Promise(r => setTimeout(r, 700));
-        const v = this._inputValue(input);
-        if (!v || !v.trim() || v === this.PLACEHOLDER) return true;  // 已发送
-        console.warn('[bridge] 自动发送点击后未清空，键盘兜底');
-      }
-      input.focus();
-      input.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', ctrlKey: true, bubbles: true }));
-      await new Promise(r => setTimeout(r, 300));
-      input.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true }));
-      await new Promise(r => setTimeout(r, 600));
-      return true;
-    },
-
     async injectRolecard(rolecard, force) {
       if (!rolecard) return false;
       try {
@@ -656,37 +636,22 @@
       }
     },
 
-    async sendMessage(text) {
-      const input = this._findInput();
-      if (!input) return false;
-      this._setInput(input, text);
-      await new Promise(r => setTimeout(r, 400));  // 等 React onChange 生效
-      const send = this._findSend();
-      if (send) {
-        send.click();
-        // 验证发送成功：输入框应被清空
-        await new Promise(r => setTimeout(r, 600));
-        const v = this._inputValue(input);
-        if (!v || !v.trim()) return true;  // 已清空 = 发送成功
-        console.warn('[bridge] 点击发送后输入框未清空，尝试键盘兜底');
-      }
-      // 键盘兜底（Ctrl+Enter 与 Enter 都试）
-      input.focus();
-      input.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', ctrlKey: true, bubbles: true }));
-      await new Promise(r => setTimeout(r, 300));
-      input.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true }));
-      await new Promise(r => setTimeout(r, 600));
-      return true;
-    },
 
     // 回填工具结果：直接填入真实结果文本（不依赖占位符+请求体替换——
     // 该机制依赖 DeepSeek 接口结构，页面更新即失效；直接回填最可靠）
     async fillInput(text) {
-      const MAX = 30000;
+      const MAX = 60000;  // 60KB：外置结果补全后完整内容可达 ~50KB（read_file 截断上限），须容下
       let display = String(text || '');
       if (display.length > MAX) display = display.slice(0, MAX) + '\n...[结果已截断，如需完整内容请分段查询]';
       const input = this._findInput();
       if (!input) return false;
+      // 输入框已有未发送的工具结果 → 追加而不是覆盖（防止多批回填互相覆盖丢失结果；
+      // 仅当输入框内容含工具结果标记时才追加，不碰用户手动输入的草稿）
+      const cur = this._inputValue(input);
+      if (cur && cur.trim() && /\[工具\d+执行结果\]/.test(cur)) {
+        display = cur + '\n\n' + display;
+        if (display.length > MAX) display = display.slice(0, MAX) + '\n...[结果已截断，如需完整内容请分段查询]';
+      }
       this._setInput(input, display);
       input.focus();
       // 高亮输入框提示用户按发送（10 秒）
@@ -854,11 +819,17 @@
       } catch (e) {}
 
       // 通道 3：DOM 观察兜底（仅检测，不保存——流式中间文本会重复触发）
+      // 文本指纹：内容未变化时跳过，避免每次字符更新都全量 querySelectorAll + 正则；
+      // 指纹带 30s 时间桶，同一文本 30 秒后重新检测（不遗漏长时间后的相同消息）
+      let lastTextKey = null;
       const observer = new MutationObserver(() => {
         const msgs = document.querySelectorAll('[class*="message"], [class*="markdown"], .ds-markdown');
         if (!msgs.length) return;
         const last = msgs[msgs.length - 1];
         const text = (last.textContent || '').trim();
+        const key = Math.floor(Date.now() / 30000) + ':' + text.length + ':' + text.slice(-300);
+        if (key === lastTextKey) return;
+        lastTextKey = key;
         if (text) detect(text);
       });
       observer.observe(document.body, { childList: true, subtree: true, characterData: true });
@@ -900,7 +871,9 @@
   if (!core || !adapter) return;
   if (!adapter.match.test(location.href)) return;
 
-  let processing = false;
+  let pendingCalls = [];     // 待执行调用累积（流式期间模型连续输出的多个调用合并成一批执行）
+  let debounceTimer = null;  // 防抖 timer：流式静止 600ms 后批量执行，期间新调用自动合并
+  let busy = false;          // 批次执行中（仅防止并发执行批次，绝不拦截新到达的调用）
   let lastProcessed = null;  // {key, ts} 调用去重（30s 窗口）
 
   async function init() {
@@ -945,29 +918,64 @@
     });
 
     function checkCalls(text, notify) {
-      if (processing || !core.hasToolCalls(text)) return;
+      if (!core.hasToolCalls(text)) return;
       const calls = core.parseToolCalls(text);
       if (!calls.length) {
         // 完整文本解析失败 → 提示（模型格式错误，避免"无反应"困惑）；流式中间态不提示
         if (notify) adapter.setStatus('⚠️ 模型输出的工具调用格式有误（JSON 引号未转义），请让它重试');
         return;
       }
-      const key = JSON.stringify(calls.map(function (c) { return [c.name, c.arguments]; }));
-      // 去重防重复执行：仅 30 秒内的相同调用算重复（跨会话/用户重试的同内容调用不受影响）
-      const now = Date.now();
-      if (lastProcessed && lastProcessed.key === key && now - lastProcessed.ts < 30000) return;
-      lastProcessed = { key: key, ts: now };
-      handleToolCalls(calls);
+      queueCalls(calls);
+    }
+
+    // 累积调用 + 防抖合并（修复"多调用只有第一个回填"的 bug）：
+    // 旧实现用 processing 全局锁挡重复，但流式输出时 DOM 通道先检测到第 1 个调用并置锁，
+    // 后续调用（含 fetch/XHR 完整文本通道）全部被 processing 拦截丢弃 → 只回填第一个。
+    // 新实现：调用进入 pendingCalls 累积（按调用粒度去重，DOM 中间态与 fetch 完整文本
+    // 重复检测同一调用不会重复入队），流式静止 600ms 后整批执行；执行期间新到达的
+    // 调用继续累积，当前批次结束自动续跑，既不丢调用也不重复执行。
+    function queueCalls(calls) {
+      let added = false;
+      for (const c of calls) {
+        const key = JSON.stringify([c.name, c.arguments]);
+        if (pendingCalls.some(function (p) { return JSON.stringify([p.name, p.arguments]) === key; })) continue;
+        pendingCalls.push(c);
+        added = true;
+      }
+      if (!added) return;
+      if (debounceTimer) clearTimeout(debounceTimer);
+      debounceTimer = setTimeout(flushPending, 600);
+    }
+
+    async function flushPending() {
+      if (busy || !pendingCalls.length) return;
+      busy = true;
+      try {
+        const calls = pendingCalls;
+        pendingCalls = [];
+        const key = JSON.stringify(calls.map(function (c) { return [c.name, c.arguments]; }));
+        // 去重防重复执行：仅 30 秒内的相同整批调用算重复（跨会话/用户重试的同内容调用不受影响）
+        const now = Date.now();
+        if (lastProcessed && lastProcessed.key === key && now - lastProcessed.ts < 30000) return;
+        lastProcessed = { key: key, ts: now };
+        await handleToolCalls(calls);
+      } finally {
+        busy = false;
+        // 批次执行期间新累积的调用继续处理（不丢失）
+        if (pendingCalls.length) setTimeout(flushPending, 300);
+      }
     }
   }
 
   async function handleToolCalls(calls) {
-    processing = true;
     adapter.setStatus('🔧 正在执行 ' + calls.length + ' 个工具调用...');
     try {
       const resp = await core.callTools(calls);
       const results = (resp && resp.results) || [];
-      const formatted = core.formatResults(results);
+      // 外置结果自动补全（伪附件）：externalized 结果拉取完整内容内联回填，
+      // 模型直接看到完整内容（等效附件），无需再调 read_file 读外置文件
+      const enriched = await enrichExternalized(results);
+      const formatted = core.formatResults(enriched);
       // 填入输入框（占位符），autoSend 开启时自动点击发送
       const filled = await adapter.fillInput(formatted);
       if (!filled) {
@@ -982,9 +990,30 @@
       }
     } catch (e) {
       adapter.setStatus('❌ 工具执行失败: ' + (e && e.message ? e.message : e));
-    } finally {
-      setTimeout(function () { processing = false; }, 2000);
     }
+  }
+
+  // 外置结果补全：{externalized:true, file:"...result_xxx.json"} → 拉完整内容替换 summary。
+  // 失败时回退原摘要（不影响调用主流程）。
+  async function enrichExternalized(results) {
+    const out = [];
+    for (const r of results) {
+      if (r && r.externalized && r.file) {
+        try {
+          const name = String(r.file).split(/[\/]/).pop();
+          const res = await core.request(core.config.backendUrl + '/api/bridge/files/' + encodeURIComponent(name));
+          const content = res && res.data && res.data.content;
+          if (content) {
+            out.push(Object.assign({}, r, { summary: content }));
+            continue;
+          }
+        } catch (e) {
+          console.warn('[bridge] 外置结果补全失败，回退摘要: ' + (e && e.message ? e.message : e));
+        }
+      }
+      out.push(r);
+    }
+    return out;
   }
 
   init();
