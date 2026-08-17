@@ -112,6 +112,66 @@ python main.py
 }
 ```
 
+## 可选：Windows 桌面自动化（windows-mcp）
+
+如需窗口管理、鼠标点击、截图、注册表编辑等桌面自动化能力，可安装 [windows-mcp](https://github.com/anthropics/windows-mcp)：
+
+### 安装方式
+
+```bash
+# 方式 1：使用 uvx（推荐，随 uv 安装）
+uvx windows-mcp
+
+# 方式 2：使用 npx
+npx -y windows-mcp
+
+# 方式 3：全局安装
+pip install windows-mcp
+```
+
+### 配置
+
+在 `backend/config/mcp.json` 中添加服务：
+
+```json
+{
+  "services": {
+    "windows-mcp": {
+      "transport": "stdio",
+      "command": "uvx",
+      "args": ["windows-mcp"],
+      "auto_start": true
+    }
+  }
+}
+```
+
+### 提供的工具
+
+安装后将获得以下桌面自动化工具：
+- **App**: 启动/切换/关闭应用程序
+- **Click**: 鼠标点击（坐标或元素）
+- **Type**: 键盘输入文本
+- **Screenshot**: 截图
+- **Registry**: 读写 Windows 注册表
+- **Process**: 列出/终止进程
+- **Clipboard**: 剪贴板操作
+- **FileSystem**: 文件读写（带追加支持）
+- 更多...
+
+### 不安装的影响
+
+不安装 windows-mcp 不影响核心功能：
+- ✅ 文件读写（read_file / write_file，已内置 append 支持）
+- ✅ 目录操作（list_directory）
+- ✅ 搜索替换（search_replace / line_edit）
+- ✅ Git 操作
+- ✅ 终端命令执行
+- ✅ 技能系统
+- ✅ MCP 服务聚合
+
+仅缺少：窗口管理、鼠标/键盘自动化、截图、注册表编辑等桌面自动化能力。
+
 ## 工作原理（桥接协议）
 
 模型在对话中输出约定格式的工具调用，脚本捕获后调本地后端执行：
