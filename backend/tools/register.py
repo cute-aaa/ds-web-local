@@ -53,7 +53,7 @@ def register_all_builtin_tools() -> None:
             "limit": {"type": "integer", "default": 2000}},
          "required": ["path"]})
     reg.register_builtin(
-        "write_file", file_ops.write_file, "写入文件（覆盖）",
+        "write_file", file_ops.write_file, "写入文件（覆盖写入，不支持append参数；追加内容请使用mcp__windows-mcp__FileSystem工具）",
         {"type": "object", "properties": {"path": {"type": "string"}, "content": {"type": "string"}},
          "required": ["path", "content"]})
     reg.register_builtin(
