@@ -85,13 +85,15 @@ async def read_file(path: str, offset: int = 1, limit: int = 2000) -> Dict:
         return {"error": str(e)}
 
 
-async def write_file(path: str, content: str) -> Dict:
-    """写入文件（覆盖，自动建目录）。"""
+async def write_file(path: str, content: str, append: bool = False) -> Dict:
+    """写入文件（覆盖或追加，自动建目录）。"""
     try:
         p = Path(path)
         p.parent.mkdir(parents=True, exist_ok=True)
-        p.write_text(content, encoding="utf-8")
-        return {"path": str(p), "status": "success", "bytes": len(content.encode("utf-8"))}
+        mode = 'a' if append else 'w'
+        with open(p, mode, encoding="utf-8") as f:
+            f.write(content)
+        return {"path": str(p), "status": "success", "bytes": len(content.encode("utf-8")), "mode": "append" if append else "overwrite"}
     except Exception as e:
         return {"error": str(e)}
 
