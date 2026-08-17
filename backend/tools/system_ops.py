@@ -289,17 +289,20 @@ async def registry_delete(path: str, name: str = "") -> Dict[str, Any]:
 
 # ---------------------------------------------------------------- 管理员运行
 
-class _SHELLEXECUTEINFOW(ctypes.Structure):
-    _fields_ = [
-        ("cbSize", ctypes.c_uint32), ("fMask", ctypes.c_ulong),
-        ("hwnd", ctypes.c_void_p), ("lpVerb", ctypes.c_wchar_p),
-        ("lpFile", ctypes.c_wchar_p), ("lpParameters", ctypes.c_wchar_p),
-        ("lpDirectory", ctypes.c_wchar_p), ("nShow", ctypes.c_int),
-        ("hInstApp", ctypes.c_void_p), ("lpIDList", ctypes.c_void_p),
-        ("lpClass", ctypes.c_wchar_p), ("hkeyClass", ctypes.c_void_p),
-        ("dwHotKey", ctypes.c_uint32), ("hIcon", ctypes.c_void_p),
-        ("hProcess", ctypes.c_void_p),
-    ]
+if os.name == "nt":
+    class _SHELLEXECUTEINFOW(ctypes.Structure):
+        _fields_ = [
+            ("cbSize", ctypes.c_uint32), ("fMask", ctypes.c_ulong),
+            ("hwnd", ctypes.c_void_p), ("lpVerb", ctypes.c_wchar_p),
+            ("lpFile", ctypes.c_wchar_p), ("lpParameters", ctypes.c_wchar_p),
+            ("lpDirectory", ctypes.c_wchar_p), ("nShow", ctypes.c_int),
+            ("hInstApp", ctypes.c_void_p), ("lpIDList", ctypes.c_void_p),
+            ("lpClass", ctypes.c_wchar_p), ("hkeyClass", ctypes.c_void_p),
+            ("dwHotKey", ctypes.c_uint32), ("hIcon", ctypes.c_void_p),
+            ("hProcess", ctypes.c_void_p),
+        ]
+else:
+    _SHELLEXECUTEINFOW = None
 
 
 async def run_as_admin(executable: str, args: str = "", cwd: str = "",
