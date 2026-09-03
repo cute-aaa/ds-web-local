@@ -10,13 +10,28 @@ logger = get_logger("tools.file_ops")
 
 
 def _is_external_result_file(path: str) -> bool:
-    """外置结果文件（data/tmp/result_*.json）？读取它时打 _external_source 标记，
-    外置分支跳过，避免 read_file → 外置 → read_file 死循环。"""
+    """外置/附件结果文件？读取它时打 _external_source 标记，外置分支跳过，
+    避免 read_file → 外置 → read_file 死循环。
+
+    识别两类（均为后端生成、非用户数据，可安全整段返回）：
+    - 旧机制：data/tmp/result_*.json
+    - 新附件：data/attachments/<caller>/<date>/result_<request_id>.json
+    """
     from core.config import DATA_DIR
     try:
         p = Path(path).resolve()
-        tmp = (DATA_DIR / "tmp").resolve()
-        return p.parent == tmp and p.name.startswith("result_") and p.name.endswith(".json")
+        root = DATA_DIR.resolve()
+        tmp = (root / "tmp").resolve()
+        if p.parent == tmp and p.name.startswith("result_") and p.name.endswith(".json"):
+            return True
+        # data/attachments/<caller>/<date>/result_*.json
+        if p.name.startswith("result_") and p.name.endswith(".json"):
+            try:
+                rel = p.relative_to(root / "attachments")
+                return len(rel.parts) == 3  # caller / date / file
+            except ValueError:
+                return False
+        return False
     except Exception:
         return False
 

@@ -2,9 +2,9 @@
 
 [![CI](https://github.com/cute-aaa/ds-web-local/actions/workflows/ci.yml/badge.svg)](https://github.com/cute-aaa/ds-web-local/actions/workflows/ci.yml)
 
-可插拔的本地 Agent 能力中台 —— 让【网页版 DeepSeek】获得本地 Agent 能力（MCP / 文件操作 / 技能 / 桌面自动化），也让本地 agent（Hermes / Claude Desktop）复用同一套工具。
+可插拔的本地 Agent 能力中台 —— 让【网页版聊天站点（DeepSeek / 小米 MiMo Ultra）】获得本地 Agent 能力（MCP / 文件操作 / 技能 / 桌面自动化），也让本地 agent（Hermes / Claude Desktop）复用同一套工具。
 
-> ⚠️ **声明**：本项目仅供个人学习研究使用，不得用于商业用途。本项目通过浏览器油猴脚本桥接实现与 DeepSeek 网页版的交互，使用时请遵守 DeepSeek 官方服务条款。使用者需自行承担因使用本项目而产生的一切风险和责任。
+> ⚠️ **声明**：本项目仅供个人学习研究使用，不得用于商业用途。本项目通过浏览器油猴脚本桥接实现与各网页版聊天站点的交互，使用时请遵守对应站点的官方服务条款。使用者需自行承担因使用本项目而产生的一切风险和责任。
 
 ## 特性
 
@@ -20,8 +20,8 @@
 
 ```
 ┌─────────────────┐   Tampermonkey 油猴脚本    ┌──────────────────┐
-│  网页版 DeepSeek │ ◄────────────────────────► │                  │
-│  (chat.deepseek)│   start:{...}end 工具协议    │   本地后端 :8088  │
+│  网页版聊天站点    │ ◄────────────────────────► │                  │
+│  DeepSeek / MiMo │   @@tool 行锚定工具协议        │   本地后端 :8088  │
 └─────────────────┘                            │  FastAPI + MCP   │
                                                │  工具聚合中心     │
 ┌─────────────────┐   HTTP (console SPA)      │                  │
@@ -37,7 +37,7 @@
 | 部分 | 目录 | 职责 |
 |---|---|---|
 | 本地后端 | `backend/` | FastAPI + MCP 工具聚合中心（依赖 Python 3.11+） |
-| 桥接层 | `bridge/` | 网页版桥接（站点无关引擎 + DeepSeek 适配器），`build.py` 打包 user.js |
+| 桥接层 | `bridge/` | 网页版桥接（站点无关引擎 `BridgeCore` + 共享 UI 层 `BridgeUI` + 站点适配器），`build.py` 打包 user.js |
 | 管理控制台 | `console/` | React SPA（Vite + Tailwind），构建产物由后端静态托管 |
 
 ## 界面预览
@@ -86,11 +86,13 @@ python main.py
 - 后端: http://127.0.0.1:8088 （`/health` 检查）
 - 控制台: http://127.0.0.1:8088/console
 
-### 3. 安装桥接脚本（网页版 DeepSeek）
+### 3. 安装桥接脚本（网页版聊天站点）
 
 1. 安装 [Tampermonkey](https://www.tampermonkey.org/) 浏览器扩展
 2. 新建脚本，粘贴 `bridge/ds-bridge.user.js` 内容（或重新运行 `python bridge/build.py` 生成最新版）
-3. 打开 https://chat.deepseek.com —— 右上角出现状态圆点（灰 → 绿=已连接）
+3. 打开受支持站点，右上角出现状态圆点（灰 → 绿=已连接）：
+   - DeepSeek：https://chat.deepseek.com
+   - 小米 MiMo Ultra：https://ultraspeed.xiaomimimo.com
 4. **新建对话**：自动注入 role_card（系统规范 + 工具清单 + 调用示例）
 5. 直接自然语言对话即可，例如：
    - "查看 G:/Download 目录下最大的文件"
@@ -179,13 +181,24 @@ pip install windows-mcp
 模型在对话中输出约定格式的工具调用，脚本捕获后调本地后端执行：
 
 ```
-start:{"name":"list_directory","arguments":{"path":"G:/Download"}}end
+@@tool list_directory {"path":"G:/Download"}
 ```
 
 - **三通道监听**：fetch 劫持 + XHR 劫持 + DOM 观察（DeepSeek 页面怎么改都不怕）
-- **四级宽容解析**：SSE 转义反转义 → Windows 路径 `\D` 非法转义修复 → 值内未转义引号状态机 → 流式中间态容错
-- **结果回填**：执行结果直接填入输入框，按发送键提交给模型（自动发送可选，注意可能触发风控）
-- **超长结果外置**：>20KB 的结果自动落盘 `data/tmp/`，回填摘要 + 路径，模型用 read_file 按需读取
+- **行锚定解析**：一条调用独占一行、行首 `@@tool`，**无终止符**（旧协议 `start:{...}end` 已废弃，其最大缺陷是漏写 `end` 即静默失效）
+- **SSE 解码**：fetch/XHR 通道先把 SSE 流还原成模型输出原文，再按行锚定解析
+- **四级宽容解析**：SSE 转义反转义 → Windows 路径 `\D` 非法转义修复 → 值内未转义引号状态机 → 括号平衡扫描
+- **自动纠错**：格式不符时自动生成「正确格式 + 重试指令」回填输入框，无需人工介入
+- **结果回填（函数调用模式）**：每次调用返回全量信封（request_id + 工具 + 参数回显 + 状态），
+  渲染为「工具调用结果」消息回填输入框并按发送键提交（自动发送可选）；null/空/错误也必有返回；
+  回填前自动重置上一轮残留，多批结果合并为一条消息
+- **完整结果附件化**：每次调用默认落盘 `data/attachments/<caller>/<日期>/result_<request_id>.json`
+  （保留 7 天自动清理），大结果只回填预览 + 附件路径，并在输入框提示用户点「附件/📎」上传该文件取全文
+  （避免超长内容被站点截断）；`read_file` 作为用户无法上传时的兜底
+- **命令自动留存（手动兜底）**：脚本解析出的最后一条命令自动填入控制面板「手动执行」框并持久化
+  （刷新后仍在）；解析失败/格式偏差时保留原文，执行结果标注成功/失败，改参数后一键重跑
+- **多 profile 隔离**：按浏览器 profile 的 callerId 归属工具日志 / 附件 / ask_user 确认，
+  多账号连同一后端互不串扰、不可代答
 
 ## 常见问题
 

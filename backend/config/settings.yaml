@@ -36,6 +36,17 @@ security:
   approval_enabled: false
   approval_required_tools: ["terminal_run"]
 
+# 桥接可靠性 / 工具结果附件（docs/tool-call-reliability-spec.md §2.3）
+# 每次工具调用默认落盘 data/attachments/<caller_id>/<date>/result_<request_id>.json，
+# 以下策略控制服务端清理：启动时 + 每 24h 触发 sweep_attachments()
+bridge:
+  attachment_retention_days: 7      # 附件保留天数；0=不清理
+  attachment_max_per_caller: 500    # 每个 caller 最多保留文件数（超出删最旧）；0=不限
+  # 结果内联阈值：序列化后超过该长度 → 响应只回摘要 + 附件路径（完整内容在附件文件里）
+  # 调小 = 更省上下文，但模型要额外 read_file 取全量（多一次往返）；调大反之。
+  inline_max_chars: 20000
+  summary_max_chars: 8000           # 大结果回填的摘要上限（字符）
+
 # 网络工具（web_fetch / web_search）
 web:
   # 搜索引擎 HTML 端点；支持 {query} 占位，或直接以 "?q=" 结尾（自动追加编码查询词）

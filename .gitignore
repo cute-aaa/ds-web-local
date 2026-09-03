@@ -26,6 +26,12 @@ data/
 .DS_Store
 .idea/
 .vscode/
+.codebuddy/
+rc_check.json
+# 站点实测探测器产物（scripts/probe-out/）：含页面 DOM 快照，不必入库
+scripts/probe-out/
+# 探测器默认浏览器/登录态目录（含 Cookie，绝不入库）
+.chrome-test/
 
 *.tsbuildinfo
 .pytest_cache/

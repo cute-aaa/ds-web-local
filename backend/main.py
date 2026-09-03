@@ -1,4 +1,5 @@
 """后端入口：加载配置 → 建 app → uvicorn。"""
+import asyncio
 import os
 import sys
 from contextlib import asynccontextmanager
@@ -35,12 +36,27 @@ async def lifespan(app: FastAPI):
             except OSError:
                 pass
         log.info("已清理结果外置临时目录")
+    # 附件保留清理：启动执行一次 + 每 24h 周期
+    # （策略：bridge.attachment_retention_days=7 / bridge.attachment_max_per_caller=500，可配）
+    from core.attachments import sweep_attachments
+    sweep_attachments()
+
+    async def _attachment_sweep_loop():
+        try:
+            while True:
+                await asyncio.sleep(24 * 3600)
+                sweep_attachments()
+        except asyncio.CancelledError:
+            pass
+    sweep_task = asyncio.create_task(_attachment_sweep_loop())
+
     # 本地监听线程：技能目录变更 + 配置热重载自动感知
     from core.watcher import start_watchers
     start_watchers()
     log.info("系统初始化完成")
     yield
     # 关闭：停止监听 + 停止监控 + 停止所有 MCP 服务
+    sweep_task.cancel()
     from core.watcher import stop_watchers
     await stop_watchers()
     await mgr.stop_monitor()

@@ -111,7 +111,7 @@ def test_bridge_call_records_tool_call(client, tmp_path):
         "session_id": sid,
     })
     assert r.status_code == 200
-    assert r.json()["results"][0]["status"] == "success"
+    assert r.json()["results"][0]["status"] == "ok"
     calls = [e for e in _events(client, sid) if e["event_type"] == "tool_call"]
     assert len(calls) == 1
     p = calls[0]["payload"]

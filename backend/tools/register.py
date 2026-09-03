@@ -225,5 +225,19 @@ def register_all_builtin_tools() -> None:
             "timeout_sec": {"type": "integer", "default": 300}},
          "required": ["question"]})
 
+    # ---- 幂等标注（只读/无本地副作用；浏览器据此做 30s 幂等批去重）----
+    reg.mark_idempotent([
+        "read_file", "list_directory", "get_file_outline",
+        "grep_multi_search",
+        "git_status", "git_diff",
+        "read_terminal", "list_terminals",
+        "env_get", "env_list",
+        "registry_read", "registry_list",
+        "read_todos",
+        "skill",
+        "web_fetch", "web_search",
+        "job_list", "job_output",
+    ])
+
     from core.logger import get_logger
     get_logger("tools.register").info(f"已注册 {len(reg.list_builtin_tools())} 个内置工具")

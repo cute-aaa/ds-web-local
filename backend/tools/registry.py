@@ -32,18 +32,29 @@ class ToolRegistry:
     # ---- 内置工具 ----
     def register_builtin(self, name: str, handler: Callable, description: str = "",
                          input_schema: Optional[Dict] = None,
-                         hooks: Optional[Dict] = None) -> None:
+                         hooks: Optional[Dict] = None,
+                         idempotent: bool = False) -> None:
         """注册内置工具。
 
         hooks: 可选 {"pre": fn(arguments)->arguments, "post": fn(result)->result}，
         支持同步/异步；pre 在 handler 之前执行（可改写 arguments），post 之后执行（可改写 result）。
+
+        idempotent: 幂等（只读、重复执行无副作用且结果稳定）。浏览器据此决定是否做 30s
+        幂等批去重；非幂等工具（写入/终端等）绝不被静默去重，避免吞掉合法重试。
         """
         self._builtin[name] = {
             "handler": handler,
             "description": description,
             "input_schema": input_schema or {"type": "object", "properties": {}},
             "hooks": hooks or {},
+            "idempotent": bool(idempotent),
         }
+
+    def mark_idempotent(self, names) -> None:
+        """批量把工具标记为幂等（只读/无本地副作用）。"""
+        for n in names:
+            if n in self._builtin:
+                self._builtin[n]["idempotent"] = True
 
     def is_builtin(self, name: str) -> bool:
         return name in self._builtin
@@ -84,7 +95,8 @@ class ToolRegistry:
 
     def list_builtin_tools(self) -> List[Dict]:
         return [
-            {"name": n, "description": e["description"], "input_schema": e["input_schema"], "source": "builtin"}
+            {"name": n, "description": e["description"], "input_schema": e["input_schema"],
+             "source": "builtin", "idempotent": e.get("idempotent", False)}
             for n, e in self._builtin.items()
         ]
 

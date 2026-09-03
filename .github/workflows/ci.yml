@@ -35,6 +35,8 @@ jobs:
         run: node --check bridge/ds-bridge.user.js
       - name: Selftest
         run: node bridge/selftest.js
+      - name: Selftest (main flow)
+        run: node bridge/selftest-flow.js
 
   console:
     name: Console build

@@ -149,9 +149,11 @@ def test_bridge_approval_flow(approval_api_client):
     r = c.post(f"/api/approvals/{req_id}/approve")
     assert r.json()["status"] == "approved"
 
-    # 4) 批准后重试 → 真正执行
+    # 4) 批准后重试 → 真正执行（信封 status=ok，result 为工具原始返回）
     r = c.post("/api/bridge/call", json={"tool": "test_sensitive", "arguments": {"a": 1}})
-    assert r.json()["results"][0] == {"ok": True, "a": 1}
+    env = r.json()["results"][0]
+    assert env["status"] == "ok"
+    assert env["result"] == {"ok": True, "a": 1}
 
 
 def test_bridge_approval_reject(approval_api_client):
@@ -222,7 +224,9 @@ def test_bridge_ask_user_roundtrip(fresh_ask_user, fresh_approvals):
             t.join(timeout=10)
             assert not t.is_alive(), "ask_user 未解除挂起"
             assert "err" not in result
-            assert result["resp"]["results"][0] == "是"
+            env = result["resp"]["results"][0]
+            assert env["status"] == "ok"
+            assert env["result"] == "是"
 
             # 应答后 pending 清空
             r = c.get("/api/bridge/ask_user/pending")

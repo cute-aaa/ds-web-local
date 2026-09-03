@@ -1,9 +1,38 @@
-"""动态生成 role_card：工具清单 + 技能目录快照 + start:{...}end 输出格式说明。"""
+"""动态生成 role_card：工具清单 + 技能说明 + @@tool 行锚定输出格式说明。
+
+模板已外部化为 Markdown 文件，改提示词只需编辑 md —— 无需改 Python、无需改 JS 脚本、
+无需重新打包油猴脚本。
+
+分层（与 skills 一致）：
+    backend/rolecard/template.md   内置默认（随代码发布，勿直接改）
+    backend/config/rolecard.md     用户副本（首次运行自动生成，之后以它为准）
+
+占位符用「显式替换」而非 str.format：模板里可自由书写 { }，不必把花括号双写转义
+（旧实现用 .format，模板里每个 { 都要写成 {{，漏写即运行时崩溃）。
+"""
+from pathlib import Path
 from typing import Dict, List
 
 from tools.registry import get_registry
 from mcp_services.manager import get_manager
 from core.config import get_config
+
+TOOLS_PLACEHOLDER = "<!--TOOLS-->"
+SKILLS_PLACEHOLDER = "<!--SKILLS-->"
+
+_BUILTIN_TEMPLATE = Path(__file__).resolve().parent / "template.md"
+
+# 极端兜底：内置 md 也缺失时仍要能出一份可用的 role_card，不让桥接整体失效
+_FALLBACK_TEMPLATE = (
+    "# 系统规范（必须严格遵守）\n"
+    "你是运行在本地环境的工作助理，可调用下列工具完成任务。\n\n"
+    "## 工具调用格式（每行一条，行首 @@tool）\n"
+    "@@tool 工具名 {\"参数\":\"值\"}\n"
+    "一条调用独占一行、行首必须是 @@tool、无终止符。\n\n"
+    "<!--TOOLS-->\n\n<!--SKILLS-->"
+)
+
+_tpl_cache: Dict[str, object] = {"path": "", "mtime": 0.0, "text": ""}
 
 
 def _xml_escape(s: str) -> str:
@@ -46,6 +75,51 @@ def _schema_hint(input_schema: Dict) -> str:
     return hint[:200]
 
 
+def _template_file() -> Path:
+    """用户模板路径；settings.yaml 的 rolecard.template 可覆盖（相对路径基于 config 目录）。"""
+    cfg = get_config()
+    rel = cfg.get_settings("rolecard.template", "rolecard.md") or "rolecard.md"
+    p = Path(rel)
+    return p if p.is_absolute() else (Path(cfg.config_dir) / p)
+
+
+def _builtin_text() -> str:
+    """内置默认模板文本（内置 md 缺失时退到代码内兜底）。"""
+    try:
+        if _BUILTIN_TEMPLATE.exists():
+            return _BUILTIN_TEMPLATE.read_text(encoding="utf-8")
+    except Exception:
+        pass
+    return _FALLBACK_TEMPLATE
+
+
+def ensure_template_file() -> Path:
+    """确保用户模板存在：首次运行从内置默认复制一份，之后以用户副本为准。"""
+    p = _template_file()
+    if p.exists():
+        return p
+    try:
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(_builtin_text(), encoding="utf-8")
+        return p
+    except Exception:
+        return _BUILTIN_TEMPLATE
+
+
+def load_template() -> str:
+    """读取模板文本：按 mtime 缓存，文件一改下次请求即生效（无需重启后端）。"""
+    p = ensure_template_file()
+    try:
+        mt = p.stat().st_mtime
+        if _tpl_cache["path"] != str(p) or _tpl_cache["mtime"] != mt:
+            _tpl_cache["text"] = p.read_text(encoding="utf-8")
+            _tpl_cache["path"] = str(p)
+            _tpl_cache["mtime"] = mt
+        return str(_tpl_cache["text"])
+    except Exception:
+        return _builtin_text()
+
+
 def generate_role_card() -> str:
     """生成文本版 role_card，供 web 端「脑」注入使用。"""
     registry = get_registry()
@@ -67,56 +141,17 @@ def generate_role_card() -> str:
         hint = _schema_hint(t["input_schema"])
         tool_lines.append(f"- {t['name']}: {t['description']}{hint}")
 
-    # 拼接完整 role_card
-    template = """# 系统规范（必须严格遵守）
-你是运行在本地环境的工作助理，可调用本地工具完成文件操作、搜索、Git、终端、MCP 服务、技能等任务。
+    tools_text = "\n".join(tool_lines)
+    skills_text = "\n".join(_skills_section())
 
-## 工具调用格式
-需要调用工具时，必须输出如下格式（可多行并列多个调用，每行一个）：
-```
-start:{{"name":"工具名","arguments":{{"参数":"值"}}}}end
-start:{{"name":"工具名2","arguments":{{...}}}}end
-```
-完整示例（参数名必须与工具行「参数:」提示完全一致，禁止发明参数名）：
-```
-start:{{"name":"mcp__windows-mcp__App","arguments":{{"mode":"launch_executable","executable":"C:/path/app.exe","args":["-h"]}}}}end
-start:{{"name":"list_directory","arguments":{{"path":"C:/Download"}}}}end
-start:{{"name":"mcp__windows-mcp__Registry","arguments":{{"mode":"get","path":"HKCU:/Environment","name":"Path"}}}}end
-start:{{"name":"read_file","arguments":{{"path":"C:/Download/data.txt","limit":50}}}}end
-start:{{"name":"sed_replace","arguments":{{"file_path":"C:/Download/app.py","pattern":"old_func\\\\s*\\\\(","replacement":"new_func(","count":-1}}}}end
-start:{{"name":"registry_read","arguments":{{"path":"HKCU\\\\Software\\\\Microsoft\\\\Windows\\\\CurrentVersion\\\\Run","name":"WeChat"}}}}end
-start:{{"name":"env_set","arguments":{{"name":"JAVA_HOME","value":"C:/Java/jdk21","persistent":true}}}}end
-start:{{"name":"run_as_admin","arguments":{{"executable":"regedit.exe"}}}}end
-start:{{"name":"write_file","arguments":{{"path":"C:/Download/data.txt","content":"new line","append":true}}}}end
-```
-达到目标后停止输出工具调用，直接给出结论。
+    # 占位符缺失时追加到末尾，保证工具清单不会静默消失
+    tpl = load_template()
+    if TOOLS_PLACEHOLDER not in tpl:
+        tpl = tpl.rstrip() + "\n\n" + TOOLS_PLACEHOLDER
+    if SKILLS_PLACEHOLDER not in tpl:
+        tpl = tpl.rstrip() + "\n\n" + SKILLS_PLACEHOLDER
 
-## 通用规则（务必遵守）
-- Windows 路径：必须用正斜杠（C:/Download）或双反斜杠（C:\\\\Download），
-  禁止使用单反斜杠（C:\\Download 会破坏 JSON 格式导致解析失败）。
-- 工具执行需要时间：调用后等待结果返回，严禁在结果未到达时编造、猜测或伪造输出内容。
-- 若一次调用失败（路径不存在/参数错误等），根据错误信息修正后重试；不要假设结果或放弃。
-- 每次调用一个工具并观察返回结果，再决定下一步；避免一次调用多个不相关的工具。
-- 工具返回的大段内容（文件全文/目录列表等）不要原文复述，提炼要点总结即可；
-  若内容含特殊字符（框线/艺术字符等），说明其含义而非原样粘贴。
-- 读取文本文件必须用 read_file 工具（自动检测编码）；禁止用 PowerShell/终端
-  的 Get-Content/type 读取文本文件（Windows 终端默认 GBK 解码会导致中文乱码）。
-- 严禁编造工具未返回的内容（校验和、哈希、密文、文件大小等），只基于真实结果回答。
-- 用户请求涉及文件/目录/系统信息/命令执行/进程等本地内容时，必须调用相应工具
-  获取真实结果，禁止仅凭常识或记忆回答（你无法知道用户电脑的真实状态）。
-- 执行写入/修改操作后，主动验证结果，确保操作成功
-
-{tool_lines}
-
-{skills_section}"""
-
-    tool_lines_str = "\n".join(tool_lines)
-    skills_section = "\n".join(_skills_section())
-
-    return template.format(
-        tool_lines=tool_lines_str,
-        skills_section=skills_section
-    )
+    return tpl.replace(TOOLS_PLACEHOLDER, tools_text).replace(SKILLS_PLACEHOLDER, skills_text)
 
 
 def generate_tools_json() -> Dict:
@@ -126,9 +161,13 @@ def generate_tools_json() -> Dict:
     tools = []
     for t in registry.list_builtin_tools():
         tools.append({"name": t["name"], "description": t["description"],
-                      "input_schema": t["input_schema"], "source": "builtin"})
+                      "input_schema": t["input_schema"], "source": "builtin",
+                      "idempotent": bool(t.get("idempotent", False))})
+    # MCP 工具语义未知，默认非幂等（浏览器不做 30s 幂等批去重），
+    # 避免重复点击/未知副作用的调用被静默吞掉
     for full_name, info in manager.tools.items():
         tools.append({"name": full_name, "description": info["tool"].get("description", ""),
-                      "input_schema": info["tool"].get("input_schema") or {}, "source": "mcp"})
+                      "input_schema": info["tool"].get("input_schema") or {}, "source": "mcp",
+                      "idempotent": False})
     from skills.discovery import get_discovery
     return {"tools": tools, "skills": [s.name for s in get_discovery().list()]}

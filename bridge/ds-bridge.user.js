@@ -1,10 +1,12 @@
 // ==UserScript==
 // @name         DS Web Local Bridge
 // @namespace    ds-web-local
-// @version      3.2.0
-// @description  网页版 DeepSeek 桥接本地 Agent 能力（MCP/文件/技能），自动注入 role_card + 解析工具调用
+// @version      3.4.0
+// @description  网页版 DeepSeek / 小米 MiMo 桥接本地 Agent 能力（MCP/文件/技能），自动注入 role_card + 解析工具调用；面板自动留存最后一条命令，大结果提示上传附件
 // @match        https://chat.deepseek.com/*
 // @match        https://*.deepseek.com/*
+// @match        https://ultraspeed.xiaomimimo.com/*
+// @match        https://*.xiaomimimo.com/*
 // @grant        GM_xmlhttpRequest
 // @grant        GM_setValue
 // @grant        GM_getValue
@@ -24,23 +26,262 @@
   const BridgeCore = {
     config: {
       backendUrl: 'http://localhost:8088',
-      autoInject: true,  // 新建对话时自动注入上下文
+      autoInject: true,
       autoSend: false,   // 工具结果就绪后自动点击发送（默认关——可能触发 DeepSeek 风控，可手动开）
+      autoEnrichExternalized: false,  // 大结果是否自动拉取附件全量内联（默认关：只回填预览+文件路径，模型按需 read_file）
+      autoRepair: true,               // 模型输出格式不符时，自动生成纠错提示（autoSend 开则自动发送）
       rolecard: '',
       tools: [],
+
+      // ---- 稳定性调优（会话切换冷却 / 批量聚合 / 幂等重试）----
+      // 切换会话后抑制解析执行的时长：SPA 切会话时旧会话的历史 @@tool 可能仍在 DOM 中，
+      // 不抑制会被当作新调用重复执行（写入类工具重复执行即为事故）。
+      sessionSwitchCooldownMs: 5000,
+      // 一批调用全部完成后，再静默等待一段时间确认没有新调用，才合并回填。
+      // 原硬编码 600ms 偏短：模型流式输出的间隔可能更长，导致一批被拆成多次回填。
+      batchQuiesceMs: 1500,
+      // 回填完成到自动发送之间的间隔，给站点解析输入框内容留出时间。
+      autoSendDelayMs: 1000,
+      // 幂等（只读）工具调用失败后的最大重试次数；非幂等工具恒为 0，绝不自动重试。
+      callMaxRetries: 2,
+      // 含重试在内的总超时上限。
+      callTotalTimeoutMs: 30000,
+    },
+
+    // ---- 调用方身份（多 profile 场景，docs/tool-call-reliability-spec.md §2.1）----
+    // caller_id 按浏览器 profile 持久化（GM 存储，profile 内恒定）；tab_id 每页加载随机。
+    // 后端按 caller 隔离 ask_user/附件/工具日志归属。
+    _callerId: '',
+    _tabId: '',
+    _randHex(len) {
+      let s = '';
+      for (let i = 0; i < len; i++) s += '0123456789abcdef'.charAt(Math.floor(Math.random() * 16));
+      return s;
+    },
+    ensureCallerId() {
+      if (this._callerId) return this._callerId;
+      try {
+        if (typeof GM_getValue === 'function') this._callerId = GM_getValue('callerId', '');
+      } catch (e) {}
+      if (!this._callerId) {
+        this._callerId = 'c_' + this._randHex(12);
+        try { if (typeof GM_setValue === 'function') GM_setValue('callerId', this._callerId); } catch (e) {}
+      }
+      if (!this._tabId) this._tabId = this._randHex(6);
+      return this._callerId;
+    },
+    // 一次调用请求的元信息（caller/tab 恒定，batch 每次新生成）
+    _meta() {
+      return { caller_id: this.ensureCallerId(), tab_id: this._tabId, batch_id: 'b_' + this._randHex(12) };
+    },
+    // 工具是否幂等（只读/可安全去重）：以 registry 元数据为准（loadTools 拉取），缺省 false
+    isIdempotentTool(name) {
+      const t = (this.config.tools || []).find(function (x) { return x.name === name; });
+      return !!(t && t.idempotent);
+    },
+
+    // ---- 调用追踪（环形缓冲，面板「调用追踪」区可见）----
+    // 用途：工具调用链路横跨「网页输出 → 解析 → 后端 → 回填」，任一环静默失败都表现为
+    // 「没反应」。把各环节流水记下来，排查时不用开 DevTools 也能看出断在哪一步。
+    _trace: [],
+    _traceMax: 120,   // 上限，防止长会话占内存（面板只渲染末尾 40 条）
+    _traceSeq: 0,
+    trace(stage, detail) {
+      try {
+        const d = new Date();
+        const pad = function (n) { return String(n).length < 2 ? '0' + n : String(n); };
+        this._trace.push({
+          seq: ++this._traceSeq,
+          t: pad(d.getHours()) + ':' + pad(d.getMinutes()) + ':' + pad(d.getSeconds()),
+          stage: String(stage || ''),
+          detail: detail == null ? '' : String(detail),
+        });
+        if (this._trace.length > this._traceMax) this._trace.shift();
+      } catch (e) { /* 追踪失败绝不影响主流程 */ }
+    },
+    getTrace() { return this._trace.slice(); },
+    clearTrace() { this._trace = []; },
+
+    // ---- 只读结果缓存（减少重复调用）----
+    // 幂等工具（只读）在短时间内以相同参数重复调用时直接复用上次结果，省掉一次后端往返。
+    // 只缓存 status=ok 的结果——错误必须真实重试，不能被缓存掩盖。
+    // TTL 20s，刻意短于后端 30s 幂等去重：前端先命中，后端去重仍作为第二道防线。
+    _readCache: {},
+    _readCacheTtl: 20000,
+    _readCacheMax: 200,
+    _readCacheKey(name, args) {
+      try { return String(name) + '|' + JSON.stringify(args || {}); } catch (e) { return ''; }
+    },
+    getCachedResult(name, args) {
+      const key = this._readCacheKey(name, args);
+      if (!key) return null;
+      const hit = this._readCache[key];
+      if (!hit) return null;
+      if (Date.now() - hit.ts > this._readCacheTtl) { delete this._readCache[key]; return null; }
+      return hit.result;
+    },
+    cacheResult(name, args, result) {
+      const key = this._readCacheKey(name, args);
+      if (!key) return;
+      this._readCache[key] = { ts: Date.now(), result: result };
+      const keys = Object.keys(this._readCache);
+      if (keys.length > this._readCacheMax) {
+        keys.sort((a, b) => this._readCache[a].ts - this._readCache[b].ts);
+        for (const k of keys.slice(0, keys.length - 100)) delete this._readCache[k];
+      }
+    },
+    clearReadCache() { this._readCache = {}; },
+    // 追踪文本（复制/上报用）：[时间] 阶段 | 详情
+    traceText() {
+      return this._trace.map(function (r) {
+        return '[' + r.t + '] ' + r.stage + (r.detail ? ' | ' + r.detail : '');
+      }).join('\n');
+    },
+
+    // ---- 最后一条命令记忆（面板「手动执行」框自动回填）----
+    //
+    // 动机：自动解析/执行失败时，用户往往只需「原样改一点再执行」。若面板不留存刚发出的那条
+    // 命令，用户只能凭记忆重敲——MCP 长参数（base64、JSON 串）实际等于无法手动兜底。
+    // 因此命令在「解析阶段」就落存（无论后续解析/执行成败都覆盖为最新一条），并持久化到
+    // GM 存储跨刷新可用；执行结果只更新其 ok 标记，不改写命令文本。
+    _lastCommand: null,
+    _cmdMaxLen: 20000,   // 持久化上限，防止把整段超长参数写进 GM 存储
+    _manualDirty: false, // 面板手动框是否被用户改过（改过后新命令不再覆盖其编辑内容）
+
+    // 调用数组 → 可回填的命令文本（一行一条，与 @@tool 协议格式一致）
+    callsToText(calls) {
+      const lines = [];
+      for (const c of (calls || [])) {
+        if (!c || !c.name) continue;
+        let args = '{}';
+        try { args = JSON.stringify(c.arguments || {}); } catch (e) { args = '{}'; }
+        lines.push('@@tool ' + c.name + ' ' + args);
+      }
+      return lines.join('\n');
+    },
+
+    // 从原始回复里抽取 @@tool 行（解析失败时保留现场，供人工修正后重发）
+    extractCommandLines(text) {
+      const out = [];
+      const lines = this._normalizeText(text).split('\n');
+      for (const line of lines) {
+        if (/^[\s>#|`*_+~]*(?:\d+[.)][\s]*)?(?:```[a-zA-Z]*[\s]*)?@@tool/i.test(line)) {
+          out.push(line.trim());
+        }
+      }
+      return out.join('\n');
+    },
+
+    _nowText() {
+      const d = new Date();
+      const pad = function (n) { return String(n).length < 2 ? '0' + n : String(n); };
+      return d.getFullYear() + '-' + pad(d.getMonth() + 1) + '-' + pad(d.getDate()) + ' ' +
+        pad(d.getHours()) + ':' + pad(d.getMinutes()) + ':' + pad(d.getSeconds());
+    },
+
+    // 保存「最后一条命令」。source: auto|manual；invalid: 该命令未能解析出可执行调用；
+    // reason: 未识别/失败原因（面板据此提示用户从哪一步接手）。
+    saveLastCommand(text, meta) {
+      const s = String(text == null ? '' : text).trim();
+      if (!s) return null;
+      const m = meta || {};
+      const clipped = s.length > this._cmdMaxLen
+        ? s.slice(0, this._cmdMaxLen) + '\n...[命令过长，已截断存储]' : s;
+      this._lastCommand = {
+        text: clipped,
+        ts: Date.now(),
+        time: this._nowText(),
+        count: m.count || clipped.split('\n').filter(function (l) { return /@@tool/i.test(l); }).length || 1,
+        source: m.source || 'auto',
+        invalid: !!m.invalid,
+        reason: m.reason ? String(m.reason) : '',
+        ok: null,   // null=未执行/未知；true=执行成功；false=执行失败
+      };
+      this._persistLastCommand();
+      this._syncManualPanel();
+      return this._lastCommand;
+    },
+
+    // 执行完成后回填结果标记（只改 ok，不覆盖命令文本，避免把用户手动修正的内容冲掉）
+    markLastCommandResult(ok, detail) {
+      if (!this._lastCommand) return;
+      this._lastCommand.ok = !!ok;
+      if (detail) this._lastCommand.reason = String(detail).slice(0, 200);
+      this._persistLastCommand();
+      this._syncManualPanel();
+    },
+
+    getLastCommand() { return this._lastCommand; },
+
+    _persistLastCommand() {
+      try {
+        if (typeof GM_setValue === 'function' && this._lastCommand) {
+          GM_setValue('lastCommand', JSON.stringify(this._lastCommand));
+        }
+      } catch (e) { /* 存储失败不影响主流程 */ }
+    },
+
+    // 启动时恢复上次会话的最后一条命令（跨刷新可用）
+    loadLastCommand() {
+      try {
+        if (typeof GM_getValue !== 'function') return;
+        const raw = GM_getValue('lastCommand', '');
+        if (!raw) return;
+        const info = typeof raw === 'string' ? JSON.parse(raw) : raw;
+        if (info && info.text) {
+          info.ok = null;   // 上次会话的执行结果对本次无意义，复位为未知
+          this._lastCommand = info;
+        }
+      } catch (e) { /* 损坏的存储值直接忽略 */ }
+    },
+
+    // 面板提示文案（时间 · 条数 · 来源/状态）
+    lastCommandLabel() {
+      const c = this._lastCommand;
+      if (!c) return '（暂无自动保存的命令）';
+      const flags = [];
+      if (c.source === 'manual') flags.push('手动执行');
+      if (c.invalid) flags.push('未识别');
+      if (c.ok === true) flags.push('执行成功');
+      else if (c.ok === false) flags.push('执行失败');
+      return (c.time || '') + ' · ' + (c.count || 1) + ' 条' +
+        (flags.length ? ' · ' + flags.join('/') : '');
+    },
+
+    // 把最后一条命令同步到面板手动执行框：面板未打开 / 用户正在编辑 → 不动输入框，只更新提示
+    _syncManualPanel() {
+      try {
+        if (typeof document === 'undefined') return;
+        const hint = document.getElementById('dsw-manual-hint');
+        if (hint) {
+          const c = this._lastCommand;
+          hint.textContent = c
+            ? ('已自动保存：' + this.lastCommandLabel() +
+              (c.reason ? ' · ' + c.reason : '') +
+              (this._manualDirty ? '（你已修改，新命令不再覆盖）' : ''))
+            : '自动解析出的命令会保存在这里，失败时可修改后重试。';
+        }
+        if (this._manualDirty) return;
+        const box = document.getElementById('dsw-manual');
+        if (box && this._lastCommand) box.value = this._lastCommand.text;
+      } catch (e) { /* 面板不在页面时静默 */ }
     },
 
     // ---- 通用请求（GM_xmlhttpRequest 优先，绕过 CORS；fallback fetch）----
     request(url, options) {
       const opts = options || {};
       const timeoutMs = opts.timeout || 45000;  // 默认 45s 超时（防调用卡住挂"执行中"状态）
+      // 默认头必须在两个分支共用：fetch 回退分支若不带 Content-Type，
+      // 后端 pydantic 会把 JSON 字符串当成 body 原样接收 → 422
+      // （无 Tampermonkey / GM_xmlhttpRequest 不可用时的回退路径会踩到）
+      const headers = opts.headers || { 'Content-Type': 'application/json' };
       return new Promise((resolve, reject) => {
         if (typeof GM_xmlhttpRequest === 'function') {
           GM_xmlhttpRequest({
             method: opts.method || 'GET',
             url: url,
             data: opts.body || undefined,
-            headers: opts.headers || { 'Content-Type': 'application/json' },
+            headers: headers,
             timeout: timeoutMs,
             onload: (resp) => {
               try { resolve({ status: resp.status, data: JSON.parse(resp.responseText) }); }
@@ -52,7 +293,8 @@
         } else {
           const ctrl = (typeof AbortController === 'function') ? new AbortController() : null;
           const timer = ctrl ? setTimeout(() => ctrl.abort(), timeoutMs) : null;
-          fetch(url, Object.assign({}, opts, ctrl ? { signal: ctrl.signal } : {}))
+          fetch(url, Object.assign({}, opts, { headers: headers },
+            ctrl ? { signal: ctrl.signal } : {}))
             .then((r) => r.json()).then((data) => resolve({ status: 200, data }))
             .catch((e) => reject(new Error('请求超时或失败: ' + (e && e.message))))
             .finally(() => { if (timer) clearTimeout(timer); });
@@ -80,88 +322,332 @@
       } catch (e) { return false; }
     },
 
-    // 解析 start:{...}end 工具调用（支持多行、多工具、嵌套 JSON、SSE 转义容错）
-    parseToolCalls(text) {
+    // 解析文本里的全部工具调用 → [{name, arguments}]
+    // tools 可选：传入工具清单即启用白名单校验（清单外的调用直接忽略，杜绝误触发）
+    parseToolCalls(text, tools) {
       if (!text) return [];
+      const schema = this._toolMap(tools);
+      const lines = this._normalizeText(text).split('\n');
+      const re = this._toolLineRe();
       const calls = [];
-      const regex = /start\s*:\s*(\{[\s\S]*?\})\s*end/g;
-      let m;
-      while ((m = regex.exec(text)) !== null) {
-        let raw = m[1];
-        try { calls.push(JSON.parse(raw)); continue; }
-        catch (e) { /* 逐级降级解析 */ }
-        // 降级 1：SSE 报文里模型输出的 JSON 引号可能被转义（\"）→ 反转义后重试
-        try { calls.push(JSON.parse(raw.replace(/\\"/g, '"').replace(/\\\\/g, '\\'))); continue; }
-        catch (e) { /* 继续降级 */ }
-        // 降级 2：Windows 路径单反斜杠是非法 JSON 转义（\D → \\D），宽容修复后重试
-        try {
-          const fixed = raw
-            .replace(/\\"/g, '"')
-            .replace(/\\\\/g, '\\')
-            .replace(/\\([^"\\\/bfnrtu])/g, '\\\\$1');  // \X(非法) → \\X
-          calls.push(JSON.parse(fixed));
+      for (let i = 0; i < lines.length; i++) {
+        const m = lines[i].match(re);
+        if (!m) continue;
+        const name = String(m[1]);
+        let rest = m[2] || '';
+        // JSON 可能跨行（模型 pretty-print）→ 括号未平衡时续读后续行；
+        // 撞上下一个 @@tool 行或代码块围栏即止，防止把后续正文吞进参数
+        let j = i;
+        while (j + 1 < lines.length && !this._balanced(rest)) {
+          const next = lines[j + 1];
+          if (/@@tool/i.test(next) || /^[ \t]*```/.test(next)) break;
+          rest += '\n' + next;
+          j += 1;
+        }
+        i = j;
+        const args = this._parseArgs(rest);
+        if (args === null) {
+          this.trace('parse/fail', name + ' 参数 JSON 解析失败: ' +
+            String(rest).replace(/\s+/g, ' ').slice(0, 200));
           continue;
         }
-        catch (e) { /* 继续降级 */ }
-        // 降级 3：JSON 值内未转义引号（模型常见错误：command 值里嵌套 " 未转义）
-        // 状态机：在字符串值内遇到 " 且后跟非 , } : 字符 → 转义为 \"
-        try {
-          const fixed = raw
-            .replace(/\\"/g, '"')
-            .replace(/\\\\/g, '\\')
-            .replace(/\\([^"\\\/bfnrtu])/g, '\\\\$1');
-          const chars = fixed.split('');
-          let inStr = false, i = 0;
-          const out = [];
-          while (i < chars.length) {
-            const ch = chars[i];
-            if (ch === '\\') { out.push(ch); if (i + 1 < chars.length) { out.push(chars[i + 1]); i += 2; } else i++; continue; }
-            if (ch === '"') {
-              if (!inStr) { inStr = true; out.push(ch); }
-              else {
-                // 值内引号：后跟非结构字符 → 转义（字符串值中间）
-                const next = chars[i + 1];
-                if (next === undefined || /[,}:]/.test(next)) { inStr = false; out.push(ch); }
-                else { out.push('\\'); out.push(ch); }  // 值内引号 → 转义
-              }
-              i++;
-              continue;
-            }
-            if (ch === ':' && !inStr) { out.push(ch); i++; continue; }
-            out.push(ch);
-            i++;
-          }
-          calls.push(JSON.parse(out.join('')));
+        if (schema && !Object.prototype.hasOwnProperty.call(schema, name)) {
+          this.trace('parse/reject', '工具名不在清单内，已忽略: ' + name);
           continue;
         }
-        catch (e) { if (raw.length > 40) console.debug('[bridge] 解析失败（可能是流式中间态，等待完整文本）:', raw.slice(0, 60)); }
+        // 必填参数缺失 → 不执行。发出一个注定失败（甚至带副作用）的空调用比不执行更糟
+        // （实测出现过 @@tool PowerShell 未带 command 就被发出去的情况）
+        const required = (schema && schema[name] && schema[name].required) || [];
+        const missing = required.filter(function (k) {
+          const v = args[k];
+          return v === undefined || v === null || v === '';
+        });
+        if (missing.length) {
+          this.trace('parse/missing-args', name + ' 缺少必填参数 [' + missing.join(', ') +
+            '] → 未执行，请补全参数后重发');
+          continue;
+        }
+        // 参数为空但工具声明了入参：多半是模型漏写。仍执行（确实存在无参工具），
+        // 真正的拦截交给上面的 required 校验；这里只留痕，便于事后排查空调用。
+        if (schema && schema[name] && schema[name].properties &&
+          Object.keys(schema[name].properties).length && !Object.keys(args).length) {
+          this.trace('parse/empty-args', name + ' 未带任何参数（该工具有声明入参），若失败请让模型补全');
+        }
+        this._warnSuspiciousChars(name, args);
+        calls.push({ name: name, arguments: args });
       }
       return calls;
     },
 
+    // 工具清单 → {工具名: input_schema}；清单为空返回 null（跳过校验，避免未加载时误杀）
+    _toolMap(tools) {
+      const list = tools || this.config.tools || [];
+      if (!list.length) return null;
+      const map = {};
+      for (const t of list) {
+        if (typeof t === 'string') { map[t] = null; continue; }
+        if (t && t.name) map[t.name] = t.input_schema || null;
+      }
+      return map;
+    },
+
+    // 参数解析：从行内剩余文本取 JSON 对象（括号平衡切片 + 宽松解析）
+    // null = 解析失败；{} = 无参数调用
+    _parseArgs(rest) {
+      const s = String(rest || '').trim().replace(/```+$/, '').trim();
+      const i = s.indexOf('{');
+      // 有剩余文本却不含 JSON → 判定失败（避免把"@@tool x 说明文字"当无参数调用执行）
+      if (i < 0) return s ? null : {};
+      return this._parseJsonLoose(this._balancedSlice(s, i));
+    },
+
+    // 括号平衡切片：从 s[start]='{' 起扫到配对的 '}'（跳过字符串字面量内的括号）
+    _balancedSlice(s, start) {
+      let depth = 0, inStr = false, esc = false;
+      for (let i = start; i < s.length; i++) {
+        const ch = s[i];
+        if (inStr) {
+          if (esc) { esc = false; continue; }
+          if (ch === '\\') { esc = true; continue; }
+          if (ch === '"') inStr = false;
+          continue;
+        }
+        if (ch === '"') { inStr = true; continue; }
+        if (ch === '{') depth += 1;
+        else if (ch === '}') {
+          depth -= 1;
+          if (depth === 0) return s.slice(start, i + 1);
+        }
+      }
+      return s.slice(start);   // 未闭合（流式中间态）→ 返回剩余，交由宽松解析判失败
+    },
+
+    // 括号是否平衡（判断是否需续读下一行）；无 JSON 时视为平衡
+    _balanced(s) {
+      let depth = 0, inStr = false, esc = false;
+      for (let i = 0; i < s.length; i++) {
+        const ch = s[i];
+        if (inStr) {
+          if (esc) { esc = false; continue; }
+          if (ch === '\\') { esc = true; continue; }
+          if (ch === '"') inStr = false;
+          continue;
+        }
+        if (ch === '"') { inStr = true; continue; }
+        if (ch === '{') depth += 1;
+        else if (ch === '}') depth -= 1;
+      }
+      return depth <= 0;
+    },
+
+    // JSON 宽松解析：常规 → SSE 反转义 → Windows 单反斜杠修复 → 值内未转义引号修复
+    _parseJsonLoose(raw) {
+      const asArgs = (v) => (v && typeof v === 'object' && !Array.isArray(v)) ? v : null;
+      try { return asArgs(JSON.parse(raw)); } catch (e) { /* 逐级降级 */ }
+      // 降级 1：SSE 报文里模型输出的 JSON 引号可能被转义（\"）→ 反转义后重试
+      try { return asArgs(JSON.parse(raw.replace(/\\"/g, '"').replace(/\\\\/g, '\\'))); }
+      catch (e) { /* 继续降级 */ }
+      // 降级 2：Windows 路径单反斜杠是非法 JSON 转义（\D → \\D），宽容修复后重试
+      try { return asArgs(JSON.parse(this._fixBackslash(raw))); } catch (e) { /* 继续降级 */ }
+      // 降级 3：JSON 值内未转义引号（模型常见错误：command 值里嵌套 " 未转义）
+      try { return asArgs(JSON.parse(this._fixInnerQuotes(this._fixBackslash(raw)))); }
+      catch (e) { /* 继续降级 */ }
+      // 降级 4：Unicode 减号/破折号变体（U+2212 等）——网页端渲染把 ASCII '-' 换成数学减号
+      // 后命令串失效（实测 DeepSeek 把 'Get-Process' 渲染成 'Get−Process'）。
+      // 仅在解析失败的降级路径替换，避免在正常内容里误改合法字符。
+      try {
+        return asArgs(JSON.parse(this._fixDashes(this._fixInnerQuotes(this._fixBackslash(raw)))));
+      } catch (e) { /* 彻底失败 */ }
+      return null;
+    },
+
+    // Unicode 减号/破折号变体 → ASCII '-'（只在降级路径使用）
+    _fixDashes(s) {
+      return String(s).replace(/[\u2212\u2010\u2011\u2012\u2013\u2014\u2015\u207b\u208b\uff0d]/g, '-');
+    },
+
+    // 解析成功后仍可能含 Unicode 变体字符（能解析，但命令执行会失败）。
+    // 只记录提示不改内容——改内容有风险，而模型看到工具返回的错误会自行纠正。
+    _warnSuspiciousChars(name, args) {
+      try {
+        const bad = JSON.stringify(args).match(/[\u2212\u2010-\u2015\uff0d]/g);
+        if (bad) {
+          this.trace('parse/suspicious', name + ' 参数含 Unicode 减号变体 [' +
+            [...new Set(bad)].join(' ') + ']（疑似网页渲染替换了 \'-\'），若执行失败请改用 ASCII 减号');
+        }
+      } catch (e) { /* 检查失败不影响主流程 */ }
+    },
+
+    _fixBackslash(raw) {
+      return raw
+        .replace(/\\"/g, '"')
+        .replace(/\\\\/g, '\\')
+        .replace(/\\([^"\\\/bfnrtu])/g, '\\\\$1');  // \X(非法) → \\X
+    },
+
+    // 值内未转义引号修复：状态机——字符串值内遇到 " 且后跟非 , } : 字符 → 转义为 \"
+    _fixInnerQuotes(fixed) {
+      const chars = fixed.split('');
+      let inStr = false, i = 0;
+      const out = [];
+      while (i < chars.length) {
+        const ch = chars[i];
+        if (ch === '\\') { out.push(ch); if (i + 1 < chars.length) { out.push(chars[i + 1]); i += 2; } else i++; continue; }
+        if (ch === '"') {
+          if (!inStr) { inStr = true; out.push(ch); }
+          else {
+            const next = chars[i + 1];
+            if (next === undefined || /[,}:]/.test(next)) { inStr = false; out.push(ch); }
+            else { out.push('\\'); out.push(ch); }  // 值内引号 → 转义
+          }
+          i++;
+          continue;
+        }
+        if (ch === ':' && !inStr) { out.push(ch); i++; continue; }
+        out.push(ch);
+        i++;
+      }
+      return out.join('');
+    },
+
+    // ---- 工具调用解析（v4 行锚定格式）----
+    //
+    // 格式：行首 @@tool <工具名> <单行 JSON 参数>
+    //     @@tool read_file {"path":"C:/a.txt"}
+    //
+    // 为什么弃用 start:{...}end：
+    //   1) 终止符依赖：模型漏写 end → 整条不匹配 → 静默"没反应"（实测最高频故障）；
+    //   2) 正则边界脆弱：[\s\S]*? 遇嵌套 } 提前截断，只能靠多级降级补丁续命；
+    //   3) start: 是常见英文词，模型在正文里"谈论"格式时易误触发。
+    // 行锚定 + 括号平衡：调用边界由行首锚点与 JSON 自身括号决定，不存在"可以漏写的结尾"。
+    TOOL_MARKER: '@@tool',
+
+    // SSE 响应文本 → 模型实际输出文本。
+    // 网页端回复以 SSE 流返回（每行 `data: {...}`），模型输出被包在 JSON 字符串里且带转义，
+    // 直接喂给解析器会因「@@tool 不在行首」而漏检 —— 行锚定协议必须先还原原文再解析。
+    // （旧协议正则不要求行首所以能凑合，这是换协议后必须补的一环。）
+    decodeReply(raw) {
+      const s = String(raw || '');
+      if (!/(^|\n)\s*data:/.test(s)) return s;   // 非 SSE（普通 JSON/文本）→ 原样返回
+      let out = '';
+      for (const line of s.split('\n')) {
+        const m = line.match(/^\s*data:\s*(.*)$/);
+        if (!m) continue;
+        const payload = m[1].trim();
+        if (!payload || payload === '[DONE]') continue;
+        let obj;
+        try { obj = JSON.parse(payload); } catch (e) { continue; }
+        out += this._sseText(obj);
+      }
+      return out.length ? out : s;   // 解码无果 → 回退原文，避免丢信息
+    },
+
+    // 从单个 SSE 事件对象里取文本片段（站点结构不同，adapter 可覆盖本方法）
+    _sseText(obj) {
+      if (obj == null) return '';
+      if (typeof obj === 'string') return obj;
+      const v = obj.v;
+      if (typeof v === 'string') return v;
+      // OpenAI 兼容格式：{"choices":[{"delta":{"content":"..."}}]}
+      if (Array.isArray(obj.choices) && obj.choices.length) {
+        const d = obj.choices[0] && obj.choices[0].delta;
+        if (d && typeof d.content === 'string') return d.content;
+      }
+      return '';
+    },
+
+    // 隐形字符归一化：模型输出经网页端 markdown 渲染后常混入零宽字符与弯引号。
+    // 它们不可见，却会破坏行首锚定和 JSON 解析——实测 DeepSeek 会把 '-' 渲染成 U+2212、
+    // 引号渲染成弯引号、分段处插入零宽空格，不归一化调用就会"凭空消失"。
+    _normalizeText(text) {
+      return String(text == null ? '' : text)
+        .replace(/[\u200b\u200c\u200d\ufeff]/g, '')                  // 零宽/不可见 → 删除
+        .replace(/[\u201c\u201d\u201e\u201f\u2033\u275d\u275e]/g, '"')  // 弯双引号 → 直引号
+        .replace(/[\u2018\u2019\u201a\u201b\u275b\u275c]/g, "'");       // 弯单引号 → 直引号
+    },
+
+    // 行首锚定：容许 markdown 装饰（标题 #、引用 >、列表 -/1.、表格 |、加粗 **/行内代码 `、
+    // 代码块围栏 ```）与各类空白（含 NBSP）；@@tool 之前不允许出现实际文字。
+    _toolLineRe() {
+      // 工具名字符集必须保留下划线与连字符（read_file / mcp__windows-mcp__PowerShell），
+      // 只排除 markdown 装饰用的反引号、星号、波浪号与空白
+      return /^[\s>#|`*_+~]*(?:\d+[.)][\s]*)?(?:```[a-zA-Z]*[\s]*)?@@tool[`*_~\s:]*([^\s`*~]+)[\s]*([^\n]*)$/i;
+    },
+
     // 检测文本里是否含工具调用指令
     hasToolCalls(text) {
-      return /start\s*:\s*\{[\s\S]*?\}\s*end/.test(text || '');
+      if (!text) return false;
+      const lines = this._normalizeText(text).split('\n');
+      const re = /^[\s>#|`*_+~]*(?:\d+[.)][\s]*)?(?:```[a-zA-Z]*[\s]*)?@@tool[`*_~\s:]*\S+/i;
+      for (let i = 0; i < lines.length; i++) if (re.test(lines[i])) return true;
+      return false;
     },
 
-    // 单个工具调用
-    async callTool(toolName, args) {
+    // 单个工具调用（meta 可选：{caller_id, tab_id, batch_id}）
+    async callTool(toolName, args, meta) {
+      const m = Object.assign({}, this._meta(), meta || {});
       const r = await this.request(this.config.backendUrl + '/api/bridge/call', {
         method: 'POST',
-        body: JSON.stringify({ tool: toolName, arguments: args || {} }),
+        body: JSON.stringify({
+          tool: toolName, arguments: args || {},
+          caller_id: m.caller_id, tab_id: m.tab_id, batch_id: m.batch_id,
+        }),
       });
       this._checkApprovalRequired(r.data);
       return r.data;
     },
 
-    // 批量工具调用
-    async callTools(calls) {
+    // 批量工具调用（meta 可选：{caller_id, tab_id, batch_id}；同批共享一个 batch_id）
+    async callTools(calls, meta, timeoutMs) {
+      const m = Object.assign({}, this._meta(), meta || {});
       const r = await this.request(this.config.backendUrl + '/api/bridge/call', {
         method: 'POST',
-        body: JSON.stringify({ calls: calls.map(c => ({ name: c.name, arguments: c.arguments || {} })) }),
+        timeout: timeoutMs || undefined,   // 由 callToolsWithRetry 按剩余预算下发
+        body: JSON.stringify({
+          calls: calls.map(c => ({ name: c.name, arguments: c.arguments || {} })),
+          caller_id: m.caller_id, tab_id: m.tab_id, batch_id: m.batch_id,
+        }),
       });
       this._checkApprovalRequired(r.data);
       return r.data;
+    },
+
+    // 带重试的批量调用。两条硬约束，缺一不可：
+    // 1) 仅当整批全部为幂等（只读）工具时才重试 —— 写入/终端/MCP 工具重复执行即事故。
+    //    （MCP 工具的 idempotent 由后端统一标注为 false，因此天然被排除。）
+    // 2) 只重试「请求层失败」（网络错误 / 超时，即 request reject）。
+    //    HTTP 200 里携带的业务结果（status:error、approval_required）是真实结果，
+    //    绝不重试 —— 否则一次审批拒绝会被放大成 N 次无效请求。
+    async callToolsWithRetry(calls, meta) {
+      const list = calls || [];
+      const allIdempotent = list.length > 0 &&
+        list.every(function (c) { return c && this.isIdempotentTool(c.name); }, this);
+      // 非法/负值一律收敛为 0：否则 `i <= max` 恒假，会一次请求都不发却抛出 null，
+      // 上层只会看到「❌ 工具执行失败: null」，极难排查
+      const raw = allIdempotent ? this.config.callMaxRetries : 0;
+      const max = Math.max(0, typeof raw === 'number' ? Math.floor(raw) : (raw == null ? 2 : 0));
+      const deadline = Date.now() + (this.config.callTotalTimeoutMs || 30000);
+      // meta 只生成一次：让同批重试共享 batch_id，后端日志才能把几次重试串起来
+      const m = Object.assign({}, this._meta(), meta || {});
+      let lastErr = null;
+      for (let i = 0; i <= max; i++) {
+        if (i > 0) {
+          const backoff = 1000 * i;   // 线性退避：1s、2s
+          if (Date.now() + backoff > deadline) break;
+          await new Promise(function (r) { setTimeout(r, backoff); });
+          if (Date.now() >= deadline) break;   // 退避完成后复检：退避本身也可能吃掉预算
+          this.trace('call/retry', '第 ' + i + ' 次重试（整批均为只读工具）n=' + list.length);
+        }
+        const remain = deadline - Date.now();
+        if (remain <= 0) break;
+        try {
+          // 剩余预算同时约束单次请求：否则 request 默认 45s 会让「总超时」形同虚设
+          return await this.callTools(list, m, remain);
+        } catch (e) {
+          lastErr = e;
+        }
+      }
+      throw lastErr || new Error('调用未发起（重试预算不足）');
     },
 
     // 检测结果里的 approval_required → 提示用户去控制台批准后重试
@@ -177,29 +663,36 @@
     },
 
     // 轮询后端挂起的人类确认请求（每 2s，最多 60s），发现后弹确认框并回传应答
-    // question 为提示词，用于优先匹配；不匹配时取第一个挂起请求
+    // question 为提示词，用于优先匹配；只在本 caller 的挂起列表里找，不跨 caller 代答（多 profile 隔离）
     async askUser(question) {
+      const callerId = this.ensureCallerId();
+      const tabId = this._tabId;   // 同 profile 多标签：只认领本标签发起的确认请求
       const deadline = Date.now() + 60000;
       while (Date.now() < deadline) {
         let pending = [];
         try {
-          const r = await this.request(this.config.backendUrl + '/api/bridge/ask_user/pending');
+          const q = 'caller_id=' + encodeURIComponent(callerId) +
+            '&tab_id=' + encodeURIComponent(tabId);
+          const r = await this.request(this.config.backendUrl + '/api/bridge/ask_user/pending?' + q);
           pending = (r.data && r.data.pending) || [];
         } catch (e) { /* 网络抖动：继续轮询 */ }
-        const target = pending.find(p => question && p.question === question) || pending[0];
+        const target = pending.find(p => question && p.question === question) || (pending.length ? pending[0] : null);
         if (target) {
           const answer = this._promptForAnswer(target.question);
           try {
             await this.request(this.config.backendUrl + '/api/bridge/ask_user', {
               method: 'POST',
-              body: JSON.stringify({ request_id: target.request_id, answer: answer }),
+              body: JSON.stringify({
+                request_id: target.request_id, answer: answer,
+                caller_id: callerId, tab_id: tabId,
+              }),
             });
           } catch (e) { console.warn('[bridge] ask_user 应答回传失败:', e); }
           return { request_id: target.request_id, question: target.question, answer: answer };
         }
         await new Promise(res => setTimeout(res, 2000));
       }
-      return { error: '等待人类确认超时（60s），未发现挂起请求' };
+      return { error: '等待人类确认超时（60s），未发现本账号的挂起请求' };
     },
 
     // 弹确认框：优先浏览器原生 prompt()/confirm()；取消 → "用户取消"
@@ -218,10 +711,79 @@
       }
     },
 
-    // 格式化工具结果，回填给模型
+    // 把后端「逐调用全量信封」渲染成给模型的「工具调用结果」文本：
+    // 每信封一段（request_id + 工具名 + 原始调用回显 + 状态），null/错误/审批/大结果均有显式说明，
+    // 满足「任何输出（含 null）都必须返回以触发下一步」，并让模型能把结果对应回原始命令。
     formatResults(results) {
-      if (!Array.isArray(results)) results = [results];
-      return results.map((r, i) => '[工具' + (i + 1) + '执行结果]\n' + JSON.stringify(r, null, 2)).join('\n\n');
+      if (!Array.isArray(results)) results = results || [];
+      const blocks = [];
+      for (const r of results) {
+        const b = this._formatOneResult(r);
+        if (b) blocks.push(b);
+      }
+      if (!blocks.length) blocks.push('【工具结果】调用未返回结果（无）。');
+      return blocks.join('\n\n');
+    },
+
+    _formatOneResult(r) {
+      if (!r || typeof r !== 'object') return '【工具结果】未收到有效信封。';
+      const rid = r.request_id || '';
+      const tool = r.tool || 'unknown';
+      const head = '【工具结果' + (rid ? ' #' + rid : '') + '】' + tool;
+      // 原始命令回显（由信封回显的 arguments 重建，模型可据此区分同批多次调用）。
+      // 必须用当前协议格式回显：模型会把回显当模板模仿，回显旧格式会造成格式倒退。
+      let original = tool;
+      try {
+        original = '@@tool ' + tool + ' ' + JSON.stringify(r.arguments || {});
+      } catch (e) { /* 保留 tool 名 */ }
+      const lines = [head, '原始调用: ' + original];
+      // 缓存命中：明确告知模型结果来自复用，避免它误以为是新执行的结果
+      if (r._cached) lines.push('（复用 20s 内相同调用的缓存结果，未重复执行）');
+      const status = r.status || 'ok';
+      if (status === 'error') {
+        const err = r.error || {};
+        lines.push('❌ 执行失败: ' + (err.type || 'Error') +
+          (err.message ? ': ' + String(err.message).slice(0, 500) : '') +
+          '。请根据错误信息修正参数后重试（同一参数最多重试一次）。');
+        return lines.join('\n');
+      }
+      if (status === 'approval_required' || r.approval_required) {
+        lines.push('⏸ 该调用需要人工审批（request_id=' + rid + '）。请在审批控制台批准后，重新发起同一调用。');
+        return lines.join('\n');
+      }
+      // status === 'ok'
+      const v = r.result;
+      if (r.truncated && r.file) {
+        const preview = (r.summary != null ? String(r.summary) : '');
+        if (r._enriched) {
+          // 高级开关 autoEnrichExternalized：完整内容已内联到 preview，无需再提示上传
+          lines.push('完整结果（已内联，共 ' + preview.length + ' 字符，附件: ' + r.file + '）：');
+          lines.push(preview || '(内容为空)');
+          return lines.join('\n');
+        }
+        // 大结果：预览 + 附件路径。完整内容的取得方式刻意改为「提示用户上传附件」：
+        // 网页输入框对超长回填会截断，附件上传则不受此限；让模型默认 read_file 全文会多耗
+        // 一轮上下文，且长回填仍可能被截断。read_file 仅作为用户无法上传时的兜底。
+        lines.push('结果较长，已截断预览（' + preview.length + ' 字符）：');
+        lines.push(preview || '(预览为空)');
+        lines.push('完整结果已保存为附件: ' + r.file);
+        if (r.file_md) lines.push('（排版更清晰的 Markdown 版: ' + r.file_md + '）');
+        lines.push('请提示用户：在网页输入框点击「附件/📎」上传该文件，即可基于完整内容继续；' +
+          '不要要求“再发一次完整内容”，也不要默认自己 read_file 全文。' +
+          '仅当用户明确要求你直接读取、或明确无法上传附件时，才用 read_file 读取（可按 limit/offset 分段）。');
+        return lines.join('\n');
+      }
+      if (v === null || v === undefined) {
+        lines.push('✅ 返回 null（调用成功，无内容），请继续下一步。');
+        return lines.join('\n');
+      }
+      lines.push('结果:');
+      try {
+        lines.push(typeof v === 'string' ? v : JSON.stringify(v, null, 2));
+      } catch (e) {
+        lines.push(String(v));
+      }
+      return lines.join('\n');
     },
 
     // 保存模型输出到后端（data/conversations/*.log），供调试/审计（内容 hash 去重）
@@ -239,7 +801,11 @@
       try {
         await this.request(this.config.backendUrl + '/api/bridge/log', {
           method: 'POST',
-          body: JSON.stringify({ role: role || 'assistant', content: s.slice(0, 20000) }),
+          body: JSON.stringify({
+            role: role || 'assistant',
+            content: s.slice(0, 20000),
+            caller_id: this.ensureCallerId(),
+          }),
         });
       } catch (e) { /* 保存失败静默（不影响对话） */ }
     },
@@ -251,8 +817,22 @@
           this.config.backendUrl = GM_getValue('backendUrl', this.config.backendUrl);
           this.config.autoInject = GM_getValue('autoInject', this.config.autoInject);
           this.config.autoSend = GM_getValue('autoSend', this.config.autoSend);
+          this.config.autoEnrichExternalized =
+            GM_getValue('autoEnrichExternalized', this.config.autoEnrichExternalized);
+          this.config.autoRepair = GM_getValue('autoRepair', this.config.autoRepair);
+          this.config.sessionSwitchCooldownMs =
+            GM_getValue('sessionSwitchCooldownMs', this.config.sessionSwitchCooldownMs);
+          this.config.batchQuiesceMs =
+            GM_getValue('batchQuiesceMs', this.config.batchQuiesceMs);
+          this.config.autoSendDelayMs =
+            GM_getValue('autoSendDelayMs', this.config.autoSendDelayMs);
+          this.config.callMaxRetries = GM_getValue('callMaxRetries', this.config.callMaxRetries);
+          this.config.callTotalTimeoutMs =
+            GM_getValue('callTotalTimeoutMs', this.config.callTotalTimeoutMs);
         }
       } catch (e) {}
+      this.ensureCallerId();
+      this.loadLastCommand();   // 恢复上次会话自动保存的最后一条命令（面板手动兜底用）
     },
     saveConfig() {
       try {
@@ -260,6 +840,13 @@
           GM_setValue('backendUrl', this.config.backendUrl);
           GM_setValue('autoInject', this.config.autoInject);
           GM_setValue('autoSend', this.config.autoSend);
+          GM_setValue('autoEnrichExternalized', this.config.autoEnrichExternalized);
+          GM_setValue('autoRepair', this.config.autoRepair);
+          GM_setValue('sessionSwitchCooldownMs', this.config.sessionSwitchCooldownMs);
+          GM_setValue('batchQuiesceMs', this.config.batchQuiesceMs);
+          GM_setValue('autoSendDelayMs', this.config.autoSendDelayMs);
+          GM_setValue('callMaxRetries', this.config.callMaxRetries);
+          GM_setValue('callTotalTimeoutMs', this.config.callTotalTimeoutMs);
         }
       } catch (e) {}
     },
@@ -288,112 +875,38 @@
     },
   };
 
-  global.BridgeCore = BridgeCore;
-})(typeof window !== 'undefined' ? window : this);
-
-/**
- * DeepSeek 网页版（chat.deepseek.com）适配器
- * 基于 v1 js2.js 验证过的机制重写：React 受控输入框 native setter 注入、
- * 输入框容器内定位发送按钮（避免误点全局按钮）、fetch/XHR 劫持 + DOM 观察
- * 双通道监听、右上角常驻状态按钮 + 配置面板。
- */
-(function (global) {
-  'use strict';
-
-  const DeepSeekAdapter = {
-    id: 'deepseek',
-    name: 'DeepSeek',
-    match: /chat\.deepseek\.com/,
-
-    _toast: null,
-    _statusBtn: null,
-    _configPanel: null,
-    _replyHandler: null,
-    _backendUrl: 'http://localhost:8088',
-    _autoInject: true,
-
-    // 输入框选择器（多候选，容错）
-    INPUT_SELECTORS: [
-      'textarea._27c9245',        // v1 实测类名（保留）
-      'textarea[placeholder]',
-      'textarea',
-      '#chat-input',
-      '.chat-input',
-      '[contenteditable="true"]',
-    ],
-
-    // 发送按钮选择器（容器内优先，全局兜底）
-    SEND_SELECTORS: [
-      'button[type="submit"]',
-      'button:has(svg)',
-      '.send-btn',
-      '[class*="send"]',
-      'div[role="button"]',
-    ],
-
-    _findInput() {
-      for (const sel of this.INPUT_SELECTORS) {
-        const el = document.querySelector(sel);
-        if (el) return el;
-      }
-      return null;
-    },
-
-    // 发送按钮定位：基于输入框容器（form/父级链）内查找，避免误点搜索/附件/保存等按钮
-    // DeepSeek 实测：输入框行内并排 文件按钮(左) + 发送按钮(右)，
-    // 发送键特征 ds-button--iconLabelPrimary；用 x 坐标取最右侧（发送键），
-    // 并排除 aria-label 含 上传/文件/attach 的按钮
-    _findSend() {
-      const input = this._findInput();
-      if (input) {
-        let node = input;
-        for (let i = 0; i < 6 && node; i++) {
-          node = node.parentElement;
-          if (!node) continue;
-          try {
-            const candidates = Array.from(node.querySelectorAll('.ds-button--iconLabelPrimary, [class*="iconLabelPrimary"]'));
-            const filtered = candidates.filter(b => {
-              const label = (b.getAttribute && b.getAttribute('aria-label')) || '';
-              return !/上传|文件|attach|voice|语音/i.test(label);
-            });
-            if (filtered.length) {
-              // 取最右侧（x 最大）的——发送键在输入框行最右
-              filtered.sort((a, b) => {
-                const ra = a.getBoundingClientRect(), rb = b.getBoundingClientRect();
-                return (rb.right || 0) - (ra.right || 0);
-              });
-              const btn = filtered[0];
-              return btn.closest('button, div[role="button"], [class*="ds-button"]') || btn;
-            }
-          } catch (e) {}
-        }
-        // 输入框自身的 form 内 submit
-        try {
-          const form = input.closest('form');
-          if (form) {
-            const submit = form.querySelector('button[type="submit"], input[type="submit"]');
-            if (submit) return submit;
-          }
-        } catch (e) {}
-      }
-      // 全局兜底：仅限明确的发送特征（iconLabelPrimary 优先，其次含 send 类名）
-      try {
-        const g1 = document.querySelector('.ds-button--iconLabelPrimary');
-        if (g1) return g1;
-      } catch (e) {}
-      for (const sel of this.SEND_SELECTORS) {
-        try {
-          const el = document.querySelector(sel);
-          if (el) return el;
-        } catch (e) {}
-      }
-      return null;
-    },
+  /**
+   * 站点无关的「呈现 / 注入」层（v3.3.0）
+   *
+   * 由来：这部分逻辑原写在 adapters/deepseek.js 中，与 DeepSeek 专属选择器混杂。
+   * 接入小米 MiMo 时若整份复制会产生约 300 行重复代码，且后续任何 UI 修复都要改两处，
+   * 故上提为共享层。
+   *
+   * 用法：adapter 声明站点差异后，在文件末尾调用 BridgeUI.install(MyAdapter) 混入通用方法。
+   *       adapter 上已存在的同名成员优先保留（用于覆盖站点专属行为，
+   *       例如 DeepSeek 的发送按钮定位逻辑）。
+   *
+   * adapter 需声明的站点差异：
+   *   INPUT_SELECTORS    输入框候选选择器（按优先级）
+   *   SEND_SELECTORS     发送按钮候选选择器（SEND_STRATEGY='click' 时使用）
+   *   MESSAGE_SELECTORS  消息容器候选选择器（DOM 观察通道取最后一条）
+   *   API_URL_PATTERN    聊天接口 URL 正则（fetch/XHR 劫持过滤，务必精确到生成接口，
+   *                      否则心跳轮询会持续触发 fullHandler → 浪费后端调用并撞限流）
+   *   ROLECARD_MARKER    注入去重标记文本
+   *   SEND_STRATEGY      'keyboard' | 'click'
+   *   SEND_KEY_SEQUENCE  键盘发送的按键序列（keyboard 策略）
+   *   MAX_FILL           回填截断上限（字符）
+   */
+  const BridgeUI = {
+    // 回填内容所有权标记：判断输入框里的内容是「桥接回填的工具结果」还是「用户草稿」。
+    // 含标记的内容可按轮次清残留/续接；用户草稿（无标记）绝不清除。
+    RESULT_MARKER: '【工具结果',
 
     // ---- 状态按钮 + 配置面板 ----
 
     ensureStatusButton() {
       if (this._statusBtn) return;
+      this._ensurePulseStyle();
       const btn = document.createElement('div');
       btn.style.cssText = [
         'position:fixed', 'top:16px', 'right:16px', 'z-index:2147483646',
@@ -410,25 +923,59 @@
       this._setStatusColor('unknown');
     },
 
+    // 工具调用状态 → 圆点颜色（主流程在关键节点显式驱动，不依赖 toast 文案前缀）
+    STATE_STYLE: {
+      connected: { color: '#10b981', label: '已连接' },
+      busy: { color: '#3b82f6', label: '工具调用执行中' },
+      error: { color: '#ef4444', label: '调用失败' },
+      warning: { color: '#f59e0b', label: '需人工审批 / 格式待修正' },
+      unknown: { color: '#9ca3af', label: '未知' },
+    },
+    setCallState(state) { this._setStatusColor(state); },
+
+    // 执行中状态的呼吸动画（keyframes 全局注入一次）
+    _ensurePulseStyle() {
+      try {
+        if (document.getElementById('dsw-pulse-style')) return;
+        const st = document.createElement('style');
+        st.id = 'dsw-pulse-style';
+        st.textContent = '@keyframes dsw-pulse{0%,100%{opacity:1;transform:scale(1)}' +
+          '50%{opacity:.4;transform:scale(1.35)}}';
+        document.head.appendChild(st);
+      } catch (e) { /* 样式注入失败不影响主流程 */ }
+    },
+
     _setStatusColor(state) {
       if (!this._statusBtn) return;
-      const colors = {
-        connected: '#10b981', error: '#ef4444', busy: '#3b82f6',
-        warning: '#f59e0b', unknown: '#9ca3af',
-      };
-      this._statusBtn.style.background = colors[state] || colors.unknown;
-      this._statusBtn.title = 'DS Bridge: ' + (state === 'connected' ? '已连接' :
-        state === 'error' ? '错误' : state === 'busy' ? '执行中' :
-        state === 'warning' ? '警告' : '未知') + '（点击打开配置）';
+      const s = this.STATE_STYLE[state] || this.STATE_STYLE.unknown;
+      this._statusBtn.style.background = s.color;
+      this._statusBtn.title = 'DS Bridge: ' + s.label + '（点击打开配置）';
+      // 执行中：呼吸动画，一眼可辨"正在跑"；其余状态静止
+      this._statusBtn.style.animation =
+        (state === 'busy') ? 'dsw-pulse 1s ease-in-out infinite' : '';
     },
 
     _toggleConfigPanel() {
       if (this._configPanel) {
+        this._stopTraceTimer();
         this._configPanel.remove();
         this._configPanel = null;
+        window.BridgeCore._manualDirty = false;   // 关面板即复位编辑标记，下次打开重新回填最后一条命令
         return;
       }
       const self = this;
+      // 大结果自动内联开关初值来自 BridgeCore.config（loadConfig 已从 GM 读取）
+      let enrichOn = false;
+      try {
+        enrichOn = !!(window.BridgeCore && window.BridgeCore.config &&
+          window.BridgeCore.config.autoEnrichExternalized);
+      } catch (e) {}
+      // 自动纠错开关初值（默认开）
+      let repairOn = true;
+      try {
+        repairOn = !!(window.BridgeCore && window.BridgeCore.config &&
+          window.BridgeCore.config.autoRepair);
+      } catch (e) {}
       const panel = document.createElement('div');
       panel.style.cssText = [
         'position:fixed', 'top:38px', 'right:16px', 'z-index:2147483646',
@@ -450,13 +997,69 @@
         'style="width:100%;padding:7px;border:1px solid #d1d5db;border-radius:8px;box-sizing:border-box;margin-bottom:10px;font-size:13px"/>' +
         '<label style="display:flex;align-items:center;gap:6px;margin-bottom:8px;cursor:pointer">' +
         '<input type="checkbox" id="dsw-auto" ' + (this._autoInject ? 'checked' : '') + '/> 自动注入 role_card</label>' +
-        '<label style="display:flex;align-items:center;gap:6px;margin-bottom:12px;cursor:pointer" title="工具结果就绪后自动点击发送（可能触发 DeepSeek 风控）">' +
+        '<label style="display:flex;align-items:center;gap:6px;margin-bottom:8px;cursor:pointer" title="工具结果就绪后自动发送（可能触发站点风控）">' +
         '<input type="checkbox" id="dsw-send" ' + (this._autoSend ? 'checked' : '') + '/> 自动发送工具结果</label>' +
+        '<label style="display:flex;align-items:center;gap:6px;margin-bottom:12px;cursor:pointer" title="大结果默认回填预览+附件文件路径，模型按需 read_file；开启后自动拉取附件全量内联（更占上下文）">' +
+        '<input type="checkbox" id="dsw-enrich" ' + (enrichOn ? 'checked' : '') + '/> 自动内联外置大结果</label>' +
+        '<label style="display:flex;align-items:center;gap:6px;margin-bottom:12px;cursor:pointer" title="模型输出的工具调用格式不符时，自动生成纠错提示填入输入框；开启「自动发送」时会一并发送，让链路自动收敛">' +
+        '<input type="checkbox" id="dsw-repair" ' + (repairOn ? 'checked' : '') + '/> 自动纠错格式偏差</label>' +
         '<div id="dsw-dirs" style="margin-bottom:12px;font-size:11px;color:#6b7280">加载目录信息…</div>' +
+        // ---- 调用追踪：模型回复/解析/后端调用/回填各环节流水，排查「没反应」的第一现场 ----
+        '<div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:6px">' +
+        '<span style="font-weight:600">📋 调用追踪</span>' +
+        '<span style="font-size:11px;color:#6b7280">1.5s 刷新</span></div>' +
+        '<div id="dsw-trace" style="max-height:200px;overflow:auto;background:#0f172a;color:#e5e7eb;' +
+        'border-radius:8px;padding:8px;margin-bottom:6px;font:11px/1.55 ui-monospace,Menlo,Consolas,monospace;' +
+        'white-space:pre-wrap;word-break:break-all">载入中…</div>' +
+        '<div style="display:flex;gap:6px;margin-bottom:12px">' +
+        '<button id="dsw-trace-copy" style="flex:1;padding:6px;background:#374151;color:#fff;border:none;' +
+        'border-radius:8px;cursor:pointer;font-size:12px">📄 复制追踪</button>' +
+        '<button id="dsw-trace-clear" style="flex:1;padding:6px;background:#9ca3af;color:#fff;border:none;' +
+        'border-radius:8px;cursor:pointer;font-size:12px">🗑 清空</button>' +
+        '</div>' +
+        // ---- 手动执行：绕过模型直接调用工具（调试工具 / 模型格式失败时的人工兜底）----
+        // 命令来源：自动解析出的最后一条命令会自动填入（GM 持久化，跨刷新仍在），失败时
+        // 用户改参数即可重试；「填入最后一条」用于用户改乱后一键还原。
+        '<div style="display:flex;align-items:center;justify-content:space-between;margin:10px 0 6px">' +
+        '<span style="font-weight:600">⚡ 手动执行</span>' +
+        '<button id="dsw-manual-recall" title="把自动保存的最后一条命令填入下方输入框" ' +
+        'style="padding:3px 8px;background:#eef2ff;color:#4338ca;border:1px solid #c7d2fe;' +
+        'border-radius:6px;cursor:pointer;font-size:11px">↩ 填入最后一条</button></div>' +
+        '<textarea id="dsw-manual" rows="2" placeholder="@@tool read_file {&quot;path&quot;:&quot;C:/a.txt&quot;}" ' +
+        'style="width:100%;padding:7px;border:1px solid #d1d5db;border-radius:8px;box-sizing:border-box;' +
+        'margin-bottom:4px;font:12px ui-monospace,Menlo,Consolas,monospace;resize:vertical"></textarea>' +
+        '<div id="dsw-manual-hint" style="font-size:11px;color:#6b7280;margin-bottom:6px;line-height:1.4">' +
+        '自动解析出的命令会保存在这里，失败时可修改后重试。</div>' +
+        '<div style="display:flex;gap:6px;margin-bottom:6px">' +
+        '<button id="dsw-run" style="flex:1;padding:6px;background:#4f46e5;color:#fff;border:none;' +
+        'border-radius:8px;cursor:pointer;font-size:12px">▶ 执行</button>' +
+        '<button id="dsw-run-fill" style="flex:1;padding:6px;background:#059669;color:#fff;border:none;' +
+        'border-radius:8px;cursor:pointer;font-size:12px">▶ 执行并回填</button>' +
+        '</div>' +
+        '<div id="dsw-manual-out" style="max-height:160px;overflow:auto;background:#0f172a;color:#e5e7eb;' +
+        'border-radius:8px;padding:8px;margin-bottom:12px;font:11px/1.55 ui-monospace,Menlo,Consolas,monospace;' +
+        'white-space:pre-wrap;word-break:break-all">（执行结果显示在这里）</div>' +
         '<button id="dsw-save" ' +
         'style="width:100%;padding:8px;background:#4f46e5;color:#fff;border:none;border-radius:8px;cursor:pointer;font-size:13px">保存并重连</button>';
       document.body.appendChild(panel);
       this._configPanel = panel;
+
+      // 手动执行框：面板一打开就回填「最后一条命令」（自动解析时已落存，GM 持久化跨刷新可用）。
+      // 用户一旦改动即标记 dirty —— 此后新到达的命令不再覆盖其编辑内容，避免"正在改参数时
+      // 被自动填入的命令冲掉"。改乱后可用「↩ 填入最后一条」一键还原。
+      const manualBox = panel.querySelector('#dsw-manual');
+      const manualOut = panel.querySelector('#dsw-manual-out');
+      window.BridgeCore._manualDirty = false;
+      try {
+        window.BridgeCore.loadLastCommand();
+        const last = window.BridgeCore.getLastCommand();
+        if (last && last.text) manualBox.value = last.text;
+        window.BridgeCore._syncManualPanel();
+      } catch (e) { /* 回填失败不影响面板其他功能 */ }
+      manualBox.addEventListener('input', () => {
+        window.BridgeCore._manualDirty = true;
+        try { window.BridgeCore._syncManualPanel(); } catch (e) {}
+      });
 
       // 状态 + 目录信息（异步加载）
       const statusEl = panel.querySelector('#dsw-status');
@@ -511,22 +1114,148 @@
           self.setStatus('❌ 技能刷新失败: ' + (e && e.message || e));
         }
       });
+      // 调用追踪：复制（优先剪贴板，不可用时回退控制台，保证任何环境都拿得到）
+      panel.querySelector('#dsw-trace-copy').addEventListener('click', () => {
+        const core = window.BridgeCore;
+        const text = (core && core.traceText) ? core.traceText() : '';
+        if (!text) { self.setStatus('⚠️ 暂无追踪记录'); return; }
+        const fallback = () => { console.log('[bridge] 调用追踪:\n' + text); };
+        try {
+          if (navigator.clipboard && navigator.clipboard.writeText) {
+            navigator.clipboard.writeText(text).then(
+              () => self.setStatus('✅ 追踪记录已复制（' + text.split('\n').length + ' 行）'),
+              () => { fallback(); self.setStatus('⚠️ 剪贴板不可用，已输出到控制台'); }
+            );
+          } else { fallback(); self.setStatus('⚠️ 剪贴板不可用，已输出到控制台'); }
+        } catch (e) { fallback(); }
+      });
+      // 调用追踪：清空
+      panel.querySelector('#dsw-trace-clear').addEventListener('click', () => {
+        const core = window.BridgeCore;
+        if (core && core.clearTrace) core.clearTrace();
+        this._renderTrace();
+        self.setStatus('🗑 追踪记录已清空');
+      });
+
+      // 手动执行：绕过模型直接把调用发给后端 —— 调试工具，或模型输出格式失败时的人工兜底
+      async function runManual(fillBack) {
+        const core = window.BridgeCore;
+        const text = (manualBox.value || '').trim();
+        if (!text) {
+          manualOut.textContent = '请输入调用，例如：@@tool read_file {"path":"C:/a.txt"}';
+          return;
+        }
+        // 传 [] 跳过白名单：手动调试时工具名可能不在已加载清单内，是否存在交给后端校验
+        let calls = core.parseToolCalls(text, []);
+        if (!calls.length) {
+          const m = text.match(/^@@tool\s+(\S+)/i);
+          if (m) calls = [{ name: String(m[1]).replace(/[`"']+$/, ''), arguments: {} }];
+        }
+        if (!calls.length) {
+          manualOut.textContent = '未识别出调用。格式：@@tool 工具名 {"参数":"值"}';
+          // 保留现场：用户改错格式后仍能一键取回原始文本继续修正
+          core.saveLastCommand(text, { source: 'manual', invalid: true, reason: '未识别出可执行调用' });
+          return;
+        }
+        // 手动命令同样纳入「最后一条命令」：面板重开后仍是这一条，便于反复调试
+        core.saveLastCommand(core.callsToText(calls), { source: 'manual', count: calls.length });
+        window.BridgeCore._manualDirty = false;
+        manualOut.textContent = '执行中…';
+        core.trace('manual/run', '[' + calls.map(function (c) { return c.name; }).join(', ') +
+          '] fillBack=' + (fillBack ? 'yes' : 'no'));
+        try {
+          const resp = await core.callTools(calls);
+          const results = (resp && resp.results) || [];
+          const rendered = core.formatResults(results);
+          manualOut.textContent = rendered;
+          const failed = results.some(function (r) {
+            return r && (r.status === 'error' || r.approval_required);
+          });
+          core.markLastCommandResult(!failed, failed ? '手动执行有失败调用' : '');
+          if (fillBack) {
+            const ok = await self.fillInput(rendered + '\n\n（以上为手动执行的结果）', 'manual');
+            core.trace('manual/fill', ok ? '已回填 ' + rendered.length + ' 字符'
+              : '回填失败：未找到输入框');
+          }
+        } catch (e) {
+          manualOut.textContent = '执行失败: ' + ((e && e.message) || e);
+          core.markLastCommandResult(false, (e && e.message) || String(e));
+          core.trace('manual/error', (e && e.message) || String(e));
+        }
+      }
+      panel.querySelector('#dsw-run').addEventListener('click', () => runManual(false));
+      panel.querySelector('#dsw-run-fill').addEventListener('click', () => runManual(true));
+      // 一键取回自动保存的最后一条命令（用户改乱后可还原）
+      panel.querySelector('#dsw-manual-recall').addEventListener('click', () => {
+        try {
+          const last = window.BridgeCore.getLastCommand();
+          if (!last || !last.text) { manualOut.textContent = '暂无自动保存的命令。'; return; }
+          manualBox.value = last.text;
+          window.BridgeCore._manualDirty = false;
+          window.BridgeCore._syncManualPanel();
+          manualOut.textContent = '已填入最后一条命令（' + window.BridgeCore.lastCommandLabel() + '）';
+        } catch (e) {}
+      });
+
+      // 面板开启期间定时刷新追踪（1.5s），保证对话进行中也能看到最新流水
+      this._renderTrace();
+      this._startTraceTimer();
+
       // 保存
       panel.querySelector('#dsw-save').addEventListener('click', () => {
         this._backendUrl = (panel.querySelector('#dsw-url').value || '').trim() || 'http://localhost:8088';
         this._autoInject = panel.querySelector('#dsw-auto').checked;
         this._autoSend = panel.querySelector('#dsw-send').checked;
+        const enrich = panel.querySelector('#dsw-enrich').checked;
+        const repair = panel.querySelector('#dsw-repair').checked;
+        try {
+          if (window.BridgeCore) {
+            window.BridgeCore.config.autoEnrichExternalized = enrich;
+            window.BridgeCore.config.autoRepair = repair;
+          }
+        } catch (e) {}
         try {
           if (typeof GM_setValue === 'function') {
             GM_setValue('backendUrl', this._backendUrl);
             GM_setValue('autoInject', this._autoInject);
             GM_setValue('autoSend', this._autoSend);
+            GM_setValue('autoEnrichExternalized', enrich);
+            GM_setValue('autoRepair', repair);
           }
         } catch (e) {}
+        this._stopTraceTimer();
         panel.remove();
         this._configPanel = null;
         location.reload();
       });
+    },
+
+    // ---- 调用追踪渲染 ----
+
+    _traceTimer: null,
+    _startTraceTimer() {
+      const self = this;
+      this._stopTraceTimer();
+      this._traceTimer = setInterval(function () { self._renderTrace(); }, 1500);
+    },
+    _stopTraceTimer() {
+      if (this._traceTimer) { clearInterval(this._traceTimer); this._traceTimer = null; }
+    },
+    // 渲染最近 40 条（面板高度有限，全量可点「复制追踪」导出）
+    _renderTrace() {
+      const el = document.getElementById('dsw-trace');
+      if (!el) return;
+      const core = window.BridgeCore;
+      const rows = (core && core.getTrace) ? core.getTrace() : [];
+      if (!rows.length) {
+        el.textContent = '（暂无记录）\n模型回复 / 工具调用 / 回填各环节会自动记到这里。\n' +
+          '若模型已输出工具调用而此处仍为空，说明回复未被脚本捕获。';
+        return;
+      }
+      el.textContent = rows.slice(-40).map(function (r) {
+        return '[' + r.t + '] ' + r.stage + (r.detail ? '\n    ' + r.detail : '');
+      }).join('\n');
+      el.scrollTop = el.scrollHeight;   // 自动贴底，始终看最新
     },
 
     // ---- 轻量 toast ----
@@ -587,7 +1316,7 @@
     // ---- 注入 ----
 
     // 强制注入（跳过注入去重检查）——供面板「手动初始化」按钮
-    async forceInject(rolecard) {
+    forceInject(rolecard) {
       return this.injectRolecard(rolecard, true);
     },
 
@@ -595,9 +1324,10 @@
       if (!rolecard) return false;
       try {
         // 注入去重：页面已存在系统规范消息（刷新页面/切换会话）则跳过，避免重复注入污染对话
+        const marker = this.ROLECARD_MARKER || '系统规范（必须严格遵守）';
         if (!force) {
           try {
-            if ((document.body.innerText || '').includes('系统规范（必须严格遵守）')) {
+            if ((document.body.innerText || '').includes(marker)) {
               console.log('[bridge] 检测到已注入 role_card，跳过重复注入');
               return true;
             }
@@ -608,19 +1338,17 @@
         this._setInput(input, rolecard);
         await new Promise(r => setTimeout(r, 400));  // 等 React onChange 生效
         // 键盘发送（避免点击按钮——可能误点文件上传弹文件选择器）
-        input.focus();
-        input.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', ctrlKey: true, bubbles: true }));
-        await new Promise(r => setTimeout(r, 300));
-        input.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true }));
-        await new Promise(r => setTimeout(r, 800));
+        const sent = await this.sendMessage();
         console.log('[bridge] role_card 已注入并发送（键盘发送）');
-        return true;
+        return sent;
       } catch (e) {
         console.warn('[bridge] 注入 role_card 失败:', e);
         return false;
       }
     },
 
+    // React 受控输入框：必须用原型上的 native setter 赋值，再派发 input/change，
+    // 否则 React 无法感知变更（value 会被后续渲染覆盖回旧值）
     _setInput(input, text) {
       if (input.tagName === 'TEXTAREA' || input.tagName === 'INPUT') {
         const proto = input.tagName === 'TEXTAREA'
@@ -636,21 +1364,35 @@
       }
     },
 
-
     // 回填工具结果：直接填入真实结果文本（不依赖占位符+请求体替换——
-    // 该机制依赖 DeepSeek 接口结构，页面更新即失效；直接回填最可靠）
-    async fillInput(text) {
-      const MAX = 60000;  // 60KB：外置结果补全后完整内容可达 ~50KB（read_file 截断上限），须容下
+    // 该机制依赖站点接口结构，页面更新即失效；直接回填最可靠）
+    // turn 参数标识“轮次”：同一轮内多次回填续接追加；新轮开始前若输入框残留上一轮的
+    // 未发送结果（含回填标记）则先清空重置，保证上下文干净；用户草稿（无标记）绝不清除。
+    async fillInput(text, turn) {
+      const MAX = this.MAX_FILL || 60000;
       let display = String(text || '');
-      if (display.length > MAX) display = display.slice(0, MAX) + '\n...[结果已截断，如需完整内容请分段查询]';
+      if (!display.trim()) return false;
+      if (display.length > MAX) display = display.slice(0, MAX) + '\n...[结果已截断；完整内容已存为附件，请在网页输入框点「附件/📎」上传该文件以获取全文]';
       const input = this._findInput();
       if (!input) return false;
-      // 输入框已有未发送的工具结果 → 追加而不是覆盖（防止多批回填互相覆盖丢失结果；
-      // 仅当输入框内容含工具结果标记时才追加，不碰用户手动输入的草稿）
-      const cur = this._inputValue(input);
-      if (cur && cur.trim() && /\[工具\d+执行结果\]/.test(cur)) {
+      const cur = this._inputValue(input) || '';
+      const markerRe = /【工具结果|\[工具\d+执行结果\]/;
+      const owned = cur.trim() && markerRe.test(cur);   // 桥接回填产物（非用户草稿）
+      if (owned) {
+        const prevTurn = (this._fillTurn === undefined) ? 0 : this._fillTurn;
+        const curTurn = (turn === undefined) ? prevTurn : turn;
+        if (curTurn === prevTurn) {
+          // 同一轮：续接，不覆盖（多批结果合并成一条消息）
+          display = cur + '\n\n' + display;
+          if (display.length > MAX) display = display.slice(0, MAX) + '\n...[结果已截断；完整内容已存为附件，请在网页输入框点「附件/📎」上传该文件以获取全文]';
+        } else {
+          // 新轮：上一轮残留尚未发送 → 重置后再写入，确保上下文干净
+        }
+        this._fillTurn = curTurn;
+      } else if (cur.trim()) {
+        // 用户草稿：保留草稿，结果续接其后（不销毁用户输入）
         display = cur + '\n\n' + display;
-        if (display.length > MAX) display = display.slice(0, MAX) + '\n...[结果已截断，如需完整内容请分段查询]';
+        if (display.length > MAX) display = display.slice(0, MAX) + '\n...[结果已截断；完整内容已存为附件，请在网页输入框点「附件/📎」上传该文件以获取全文]';
       }
       this._setInput(input, display);
       input.focus();
@@ -661,21 +1403,151 @@
       return true;
     },
 
+    // ---- 发送 ----
+
+    sendMessage() {
+      if (this.SEND_STRATEGY === 'click') return this._clickSend();
+      return this._keyboardSend();
+    },
+
+    // 自动发送 = 普通发送
+    autoSend() {
+      return this.sendMessage();
+    },
+
     // 键盘发送（优先）——完全避开按钮定位（避免误点文件上传弹文件选择器）
-    async sendMessage() {
+    async _keyboardSend() {
       const input = this._findInput();
       if (!input) return false;
       input.focus();
-      input.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', ctrlKey: true, bubbles: true }));
-      await new Promise(r => setTimeout(r, 300));
-      input.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true }));
+      const seq = this.SEND_KEY_SEQUENCE || [{ key: 'Enter' }];
+      for (const init of seq) {
+        input.dispatchEvent(new KeyboardEvent('keydown',
+          Object.assign({ bubbles: true, cancelable: true }, init)));
+        await new Promise(r => setTimeout(r, 300));
+      }
       await new Promise(r => setTimeout(r, 500));
       return true;
     },
 
-    // 自动发送 = 键盘发送
-    async autoSend() {
-      return this.sendMessage();
+    // 点击发送（键盘发送不生效时的兜底）
+    async _clickSend() {
+      const input = this._findInput();
+      if (input) input.focus();
+      const btn = this._findSend();
+      if (!btn) return false;
+      btn.click();
+      await new Promise(r => setTimeout(r, 500));
+      return true;
+    },
+
+    // ---- 模型回复监听（三通道）----
+    //
+    // fullHandler：fetch/XHR 通道（流结束后的完整文本，用于保存 + 工具检测）
+    // domHandler：DOM 观察通道（流式中间文本，仅做工具检测，避免重复保存）
+    onModelReply(fullHandler, domHandler) {
+      this._replyHandler = fullHandler;
+      const detect = domHandler || fullHandler;
+      const apiPattern = this.API_URL_PATTERN;
+      const self = this;
+      // SSE 原始流 → 模型输出文本：行锚定协议要求 @@tool 处于行首，而 SSE 把文本包在
+      // JSON 字符串里，不还原就会漏检（非 SSE 文本原样返回，不丢信息）
+      const decode = function (t) {
+        try { return self.decodeReply ? self.decodeReply(t) : t; } catch (e) { return t; }
+      };
+
+      // 通道 1：fetch 劫持（响应监听）
+      try {
+        const origFetch = window.fetch;
+        if (origFetch && !window.__dswFetchHooked) {
+          window.__dswFetchHooked = true;
+          window.__dswHandler = fullHandler;
+          window.fetch = function (...args) {
+            const p = origFetch.apply(this, args);
+            try {
+              const url = String(args[0] && args[0].url ? args[0].url : args[0]);
+              if (apiPattern.test(url)) {
+                p.then((resp) => {
+                  try {
+                    resp.clone().text().then((t) => {
+                      if (t && t.length > 20) window.__dswHandler && window.__dswHandler(decode(t));
+                    }).catch(() => {});
+                  } catch (e) {}
+                }).catch(() => {});
+              }
+            } catch (e) {}
+            return p;
+          };
+        }
+      } catch (e) { console.warn('[bridge] fetch 劫持失败:', e); }
+
+      // 通道 2：XHR 劫持（老接口兜底）
+      try {
+        const origOpen = XMLHttpRequest.prototype.open;
+        const origSend = XMLHttpRequest.prototype.send;
+        if (!window.__dswXhrHooked) {
+          window.__dswXhrHooked = true;
+          window.__dswHandler = fullHandler;
+          XMLHttpRequest.prototype.open = function (method, url) {
+            this.__dswUrl = String(url);
+            return origOpen.apply(this, arguments);
+          };
+          XMLHttpRequest.prototype.send = function (body) {
+            this.addEventListener('load', () => {
+              try {
+                const u = this.__dswUrl || '';
+                if (apiPattern.test(u)) {
+                  window.__dswHandler && window.__dswHandler(decode(this.responseText || ''));
+                }
+              } catch (e) {}
+            });
+            return origSend.apply(this, arguments);
+          };
+        }
+      } catch (e) { console.warn('[bridge] XHR 劫持失败:', e); }
+
+      // 通道 3：DOM 观察兜底（仅检测，不保存——流式中间文本会重复触发）
+      // 文本指纹：内容未变化时跳过，避免每次字符更新都全量 querySelectorAll + 正则；
+      // 指纹带 30s 时间桶，同一文本 30 秒后重新检测（不遗漏长时间后的相同消息）
+      const msgSel = (this.MESSAGE_SELECTORS || []).join(', ');
+      if (!msgSel) return null;
+      let lastTextKey = null;
+      const observer = new MutationObserver(() => {
+        const msgs = document.querySelectorAll(msgSel);
+        if (!msgs.length) return;
+        const last = msgs[msgs.length - 1];
+        const text = (last.textContent || '').trim();
+        const key = Math.floor(Date.now() / 30000) + ':' + text.length + ':' + text.slice(-300);
+        if (key === lastTextKey) return;
+        lastTextKey = key;
+        if (text) detect(text);
+      });
+      observer.observe(document.body, { childList: true, subtree: true, characterData: true });
+      return observer;
+    },
+
+    // ---- DOM 工具 ----
+
+    _findInput() {
+      for (const sel of this.INPUT_SELECTORS) {
+        try {
+          const el = document.querySelector(sel);
+          if (el) return el;
+        } catch (e) {}
+      }
+      return null;
+    },
+
+    // 发送按钮定位（通用版）：按候选选择器顺序查找。
+    // 站点结构复杂时（如 DeepSeek 输入框行内并排多个按钮）由 adapter 覆盖本方法。
+    _findSend() {
+      for (const sel of this.SEND_SELECTORS) {
+        try {
+          const el = document.querySelector(sel);
+          if (el) return el;
+        } catch (e) {}
+      }
+      return null;
     },
 
     _inputValue(input) {
@@ -698,144 +1570,6 @@
       });
     },
 
-    // 双通道监听模型回复：
-    // fullHandler：fetch/XHR 通道（流结束后的完整文本，用于保存 + 工具检测）
-    // domHandler：DOM 观察通道（流式中间文本，仅做工具检测，避免重复保存）
-    onModelReply(fullHandler, domHandler) {
-      this._replyHandler = fullHandler;
-      const detect = domHandler || fullHandler;
-
-      // 通道 1：fetch 劫持（响应监听 + 请求体占位符替换——DeepSeek 可能走 fetch 而非 XHR）
-      try {
-        const origFetch = window.fetch;
-        if (origFetch && !window.__dswFetchHooked) {
-          window.__dswFetchHooked = true;
-          window.__dswHandler = fullHandler;
-          const PLACEHOLDER = this.PLACEHOLDER;
-          window.fetch = function (...args) {
-            // 请求体替换：聊天请求里占位符 → 真实工具结果
-            try {
-              const url = String(args[0] && args[0].url ? args[0].url : args[0]);
-              if (/chat\/completion/i.test(url) && args[1] && args[1].body &&
-                  typeof args[1].body === 'string' && window.__dswPendingResults &&
-                  args[1].body.includes(PLACEHOLDER)) {
-                const replaced = args[1].body.split(PLACEHOLDER).join(window.__dswPendingResults);
-                args[1] = Object.assign({}, args[1], { body: replaced });
-                console.log('[bridge] fetch 请求体占位符已替换（' + window.__dswPendingResults.length + ' 字符）');
-                const results = window.__dswPendingResults;
-                setTimeout(() => {
-                  if (window.__dswPendingResults === results) window.__dswPendingResults = '';
-                }, 1500);
-              }
-            } catch (e) {}
-            const p = origFetch.apply(this, args);
-            try {
-              const url = String(args[0] && args[0].url ? args[0].url : args[0]);
-              if (/chat|completion|conversation|message|assistant|api/i.test(url)) {
-                p.then((resp) => {
-                  try {
-                    resp.clone().text().then((t) => {
-                      if (t && t.length > 20) window.__dswHandler && window.__dswHandler(t);
-                    }).catch(() => {});
-                  } catch (e) {}
-                }).catch(() => {});
-              }
-            } catch (e) {}
-            return p;
-          };
-        }
-      } catch (e) { console.warn('[bridge] fetch 劫持失败:', e); }
-
-      // 通道 2：XHR 劫持（老接口兜底 + 请求体占位符替换）
-      try {
-        const origOpen = XMLHttpRequest.prototype.open;
-        const origSend = XMLHttpRequest.prototype.send;
-        if (!window.__dswXhrHooked) {
-          window.__dswXhrHooked = true;
-          window.__dswHandler = fullHandler;
-          const PLACEHOLDER = this.PLACEHOLDER;
-          XMLHttpRequest.prototype.open = function (method, url) {
-            this.__dswUrl = String(url);
-            return origOpen.apply(this, arguments);
-          };
-          XMLHttpRequest.prototype.send = function (body) {
-            // 请求体替换：聊天请求里占位符 → 真实工具结果（v1 机制，递归全树替换）
-            try {
-              const u = this.__dswUrl || '';
-              if (/chat\/completion/i.test(u) && body && typeof body === 'string' &&
-                  window.__dswPendingResults) {
-                const data = JSON.parse(body);
-                // 递归替换任意层级的占位符（兼容 prompt / messages[].content / 嵌套结构）
-                const replaceDeep = (obj) => {
-                  if (typeof obj === 'string') {
-                    return obj.includes(PLACEHOLDER)
-                      ? obj.split(PLACEHOLDER).join(window.__dswPendingResults) : obj;
-                  }
-                  if (Array.isArray(obj)) {
-                    let changed = false;
-                    const out = obj.map((x) => {
-                      const r = replaceDeep(x);
-                      if (r !== x) changed = true;
-                      return r;
-                    });
-                    return changed ? out : obj;
-                  }
-                  if (obj && typeof obj === 'object') {
-                    let changed = false;
-                    const out = {};
-                    for (const k of Object.keys(obj)) {
-                      const r = replaceDeep(obj[k]);
-                      if (r !== obj[k]) changed = true;
-                      out[k] = r;
-                    }
-                    return changed ? out : obj;
-                  }
-                  return obj;
-                };
-                const newData = replaceDeep(data);
-                if (newData !== data) {
-                  body = JSON.stringify(newData);
-                  console.log('[bridge] 占位符已替换为工具结果（' + window.__dswPendingResults.length + ' 字符）');
-                  const results = window.__dswPendingResults;
-                  setTimeout(() => {
-                    if (window.__dswPendingResults === results) window.__dswPendingResults = '';
-                  }, 1500);
-                } else {
-                  console.warn('[bridge] 请求体未找到占位符（可能已被发送或结构异常）');
-                }
-              }
-            } catch (e) {}
-            this.addEventListener('load', () => {
-              try {
-                const u = this.__dswUrl || '';
-                if (/chat|completion|conversation|message|assistant|api/i.test(u)) {
-                  window.__dswHandler && window.__dswHandler(this.responseText || '');
-                }
-              } catch (e) {}
-            });
-            return origSend.apply(this, arguments);
-          };
-        }
-      } catch (e) {}
-
-      // 通道 3：DOM 观察兜底（仅检测，不保存——流式中间文本会重复触发）
-      // 文本指纹：内容未变化时跳过，避免每次字符更新都全量 querySelectorAll + 正则；
-      // 指纹带 30s 时间桶，同一文本 30 秒后重新检测（不遗漏长时间后的相同消息）
-      let lastTextKey = null;
-      const observer = new MutationObserver(() => {
-        const msgs = document.querySelectorAll('[class*="message"], [class*="markdown"], .ds-markdown');
-        if (!msgs.length) return;
-        const last = msgs[msgs.length - 1];
-        const text = (last.textContent || '').trim();
-        const key = Math.floor(Date.now() / 30000) + ':' + text.length + ':' + text.slice(-300);
-        if (key === lastTextKey) return;
-        lastTextKey = key;
-        if (text) detect(text);
-      });
-      observer.observe(document.body, { childList: true, subtree: true, characterData: true });
-      return observer;
-    },
-
     // ---- 配置存取 ----
 
     loadConfig() {
@@ -856,9 +1590,209 @@
       if (cfg && typeof cfg.autoInject === 'boolean') this._autoInject = cfg.autoInject;
       if (cfg && typeof cfg.autoSend === 'boolean') this._autoSend = cfg.autoSend;
     },
+
+    // 把通用实现混入 adapter（adapter 自有成员优先，便于覆盖站点专属行为）
+    install(adapter) {
+      for (const k of Object.keys(this)) {
+        if (k === 'install') continue;
+        if (adapter[k] === undefined) adapter[k] = this[k];
+      }
+      return adapter;
+    },
   };
 
+  global.BridgeCore = BridgeCore;
+  global.BridgeUI = BridgeUI;
+})(typeof window !== 'undefined' ? window : this);
+
+/**
+ * DeepSeek 网页版（chat.deepseek.com）适配器
+ *
+ * 通用 UI / 注入 / 监听逻辑已上提至 core.js 的 BridgeUI，本文件只保留
+ * DeepSeek 站点专属部分：选择器、发送按键序列，以及发送按钮定位
+ * （DeepSeek 输入框行内并排多个按钮，需按 x 坐标取最右侧的发送键）。
+ *
+ * 基于 v1 js2.js 验证过的机制：React 受控输入框 native setter 注入、
+ * 输入框容器内定位发送按钮（避免误点全局按钮）、fetch/XHR 劫持 + DOM 观察
+ * 双通道监听、右上角常驻状态按钮 + 配置面板。
+ */
+(function (global) {
+  'use strict';
+
+  const DeepSeekAdapter = {
+    id: 'deepseek',
+    name: 'DeepSeek',
+    match: /chat\.deepseek\.com/,
+
+    _toast: null,
+    _statusBtn: null,
+    _configPanel: null,
+    _replyHandler: null,
+    _backendUrl: 'http://localhost:8088',
+    _autoInject: true,
+    _autoSend: false,
+
+    // 输入框选择器（多候选，容错）
+    INPUT_SELECTORS: [
+      'textarea._27c9245',        // v1 实测类名（保留）
+      'textarea[placeholder]',
+      'textarea',
+      '#chat-input',
+      '.chat-input',
+      '[contenteditable="true"]',
+    ],
+
+    // 发送按钮选择器（容器内优先，全局兜底）
+    SEND_SELECTORS: [
+      'button[type="submit"]',
+      'button:has(svg)',
+      '.send-btn',
+      '[class*="send"]',
+      'div[role="button"]',
+    ],
+
+    // 消息容器（DOM 观察通道取最后一条）
+    MESSAGE_SELECTORS: [
+      '[class*="message"]',
+      '[class*="markdown"]',
+      '.ds-markdown',
+    ],
+
+    // 聊天接口 URL 过滤（fetch/XHR 劫持）
+    API_URL_PATTERN: /chat|completion|conversation|message|assistant|api/i,
+
+    ROLECARD_MARKER: '系统规范（必须严格遵守）',
+    SEND_STRATEGY: 'keyboard',
+    // DeepSeek 实测：先 Ctrl+Enter 再单独 Enter 才可靠提交
+    SEND_KEY_SEQUENCE: [{ key: 'Enter', ctrlKey: true }, { key: 'Enter' }],
+    MAX_FILL: 60000,
+
+    // 发送按钮定位：基于输入框容器（form/父级链）内查找，避免误点搜索/附件/保存等按钮
+    // DeepSeek 实测：输入框行内并排 文件按钮(左) + 发送按钮(右)，
+    // 发送键特征 ds-button--iconLabelPrimary；用 x 坐标取最右侧（发送键），
+    // 并排除 aria-label 含 上传/文件/attach 的按钮
+    _findSend() {
+      const input = this._findInput();
+      if (input) {
+        let node = input;
+        for (let i = 0; i < 6 && node; i++) {
+          node = node.parentElement;
+          if (!node) continue;
+          try {
+            const candidates = Array.from(node.querySelectorAll('.ds-button--iconLabelPrimary, [class*="iconLabelPrimary"]'));
+            const filtered = candidates.filter(b => {
+              const label = (b.getAttribute && b.getAttribute('aria-label')) || '';
+              return !/上传|文件|attach|voice|语音/i.test(label);
+            });
+            if (filtered.length) {
+              // 取最右侧（x 最大）的——发送键在输入框行最右
+              filtered.sort((a, b) => {
+                const ra = a.getBoundingClientRect(), rb = b.getBoundingClientRect();
+                return (rb.right || 0) - (ra.right || 0);
+              });
+              const btn = filtered[0];
+              return btn.closest('button, div[role="button"], [class*="ds-button"]') || btn;
+            }
+          } catch (e) {}
+        }
+        // 输入框自身的 form 内 submit
+        try {
+          const form = input.closest('form');
+          if (form) {
+            const submit = form.querySelector('button[type="submit"], input[type="submit"]');
+            if (submit) return submit;
+          }
+        } catch (e) {}
+      }
+      // 全局兜底：仅限明确的发送特征（iconLabelPrimary 优先，其次含 send 类名）
+      try {
+        const g1 = document.querySelector('.ds-button--iconLabelPrimary');
+        if (g1) return g1;
+      } catch (e) {}
+      for (const sel of this.SEND_SELECTORS) {
+        try {
+          const el = document.querySelector(sel);
+          if (el) return el;
+        } catch (e) {}
+      }
+      return null;
+    },
+  };
+
+  // 混入 BridgeUI 的通用实现（adapter 上已定义的 _findSend 等优先保留）
+  global.BridgeUI.install(DeepSeekAdapter);
   global.DeepSeekAdapter = DeepSeekAdapter;
+})(typeof window !== 'undefined' ? window : this);
+
+/**
+ * 小米 MiMo Ultra（ultraspeed.xiaomimimo.com）适配器
+ *
+ * 站点特征（2026-09 实测，React + Tailwind + MobX SPA，hash 路由 #/）：
+ *   - 输入框：页面内唯一 textarea，placeholder「想做什么，尽管说，Shift + Enter 换行」
+ *     → 由 placeholder 文案可知：Enter 发送、Shift+Enter 换行，故用键盘策略，
+ *       只需派发单个 Enter（DeepSeek 需要 Ctrl+Enter 再 Enter，此处不能照搬，
+ *       否则会先触发一次空提交）。
+ *   - 发送按钮：圆形按钮，类名含 rounded-full + bg-black/90（仅作 click 兜底）。
+ *   - 消息容器：助手回复渲染在 DIV.markdown-prose.select-text.Markdown_markdown__<hash>，
+ *     其中 markdown-prose 是语义类名，Markdown_markdown__ 是 CSS Module 哈希类名
+ *     （站点重新构建后哈希会变，故两者都列，取其一命中即可）。
+ *   - 聊天接口：POST /fastchat/open-apis/bot/chat，走 fetch + SSE；
+ *     XHR 与 EventSource 均未被使用（实测 xhr=0 / es=0）。
+ *
+ * 注意：API_URL_PATTERN 必须精确到 /open-apis/bot/chat，
+ * 站点还有 heartbeat / metrics / genTitle 等高频轮询接口，
+ * 若一并匹配会导致每次心跳都触发 fullHandler（打后端 saveReply 并消耗限流额度）。
+ */
+(function (global) {
+  'use strict';
+
+  const MiMoAdapter = {
+    id: 'mimo',
+    name: 'Xiaomi MiMo Ultra',
+    match: /xiaomimimo\.com/,
+
+    _toast: null,
+    _statusBtn: null,
+    _configPanel: null,
+    _replyHandler: null,
+    _backendUrl: 'http://localhost:8088',
+    _autoInject: true,
+    _autoSend: false,
+
+    // 输入框（实测页面仅 1 个 textarea，用 placeholder 优先定位）
+    INPUT_SELECTORS: [
+      'textarea[placeholder]',
+      'textarea',
+      '[contenteditable="true"]',
+    ],
+
+    // 发送按钮（键盘策略下的兜底：圆形黑色按钮）
+    SEND_SELECTORS: [
+      'button[class*="rounded-full"][class*="bg-black"]',
+      'button[type="submit"]',
+      'div[role="button"]',
+    ],
+
+    // 消息容器：markdown-prose 为语义类名，Markdown_markdown__ 为 CSS Module 哈希兜底。
+    // 注意不要直接用 [class*="prose"]——站点内代码块带 not-prose 类名会被误匹配。
+    MESSAGE_SELECTORS: [
+      '[class*="markdown-prose"]',
+      '[class*="Markdown_markdown"]',
+    ],
+
+    // 仅匹配真正的生成接口（排除 heartbeat / metrics / genTitle 轮询）
+    API_URL_PATTERN: /open-apis\/bot\/chat/,
+
+    ROLECARD_MARKER: '系统规范（必须严格遵守）',
+    SEND_STRATEGY: 'keyboard',
+    // MiMo 实测：单个 Enter 即发送（Shift+Enter 才是换行）
+    SEND_KEY_SEQUENCE: [{ key: 'Enter' }],
+    MAX_FILL: 60000,
+  };
+
+  // 混入 BridgeUI 的通用实现（状态圆点 / 配置面板 / toast / 注入 / 回填 / 三通道监听）
+  global.BridgeUI.install(MiMoAdapter);
+  global.MiMoAdapter = MiMoAdapter;
 })(typeof window !== 'undefined' ? window : this);
 
 
@@ -866,15 +1800,33 @@
   'use strict';
 
   const core = window.BridgeCore;
-  const adapter = window.DeepSeekAdapter;
+
+  // 适配器注册表（由 build.py 注入）：取首个 match 命中当前 URL 的适配器；
+  // 未命中说明站点未适配，静默退出。
+  window.BridgeAdapters = [window.DeepSeekAdapter, window.MiMoAdapter];
+  const adapter = window.BridgeAdapters.filter(function (a) {
+    return a && a.match && a.match.test(location.href);
+  })[0];
 
   if (!core || !adapter) return;
-  if (!adapter.match.test(location.href)) return;
 
   let pendingCalls = [];     // 待执行调用累积（流式期间模型连续输出的多个调用合并成一批执行）
   let debounceTimer = null;  // 防抖 timer：流式静止 600ms 后批量执行，期间新调用自动合并
   let busy = false;          // 批次执行中（仅防止并发执行批次，绝不拦截新到达的调用）
-  let lastProcessed = null;  // {key, ts} 调用去重（30s 窗口）
+  let lastProcessed = null;  // {key, ts} 幂等批去重（30s 窗口，仅整批全为幂等工具时生效）
+  let turnResults = [];      // 当前轮累计的结果文本（多批合并成一次回填，避免逐批覆盖/残留）
+  let turnAttachments = [];  // 当前轮结果落盘的附件路径（回填失败时指引用，保证结果不丢）
+  let turnExternalized = []; // 当前轮「大结果」附件路径（非截断结果不入选）→ 提示用户上传附件以取全文
+  let quiesceTimer = null;   // 批次全部完成后静默定时器 → 结束本轮、统一回填
+  let turnSeq = 0;           // 轮次自增标识（fillInput 据此重置上一轮残留，保证上下文干净）
+  let suppressUntil = 0;     // 会话切换冷却截止时间戳：SPA 切会话期间延后执行，
+                             // 用于避开 DOM 未稳定的窗口（只延后，绝不丢弃调用）
+  let rolecardTimer = null;  // 切会话后重注入 role_card 的定时器（防连续切换叠加注入）
+
+  // 每次回填工具结果都附一行格式提醒（加固 4）：role_card 只在会话开头注入一次，
+  // 长对话中模型会逐渐"忘记"输出规范，逐轮提醒是成本最低、见效最快的纠偏手段。
+  const FORMAT_HINT = '\n\n【工具调用格式】继续调用工具请每行一条：@@tool 工具名 {"参数":"值"}' +
+    '（行首 @@tool，参数单行 JSON，无终止符，勿用代码块包裹）';
 
   async function init() {
     core.loadConfig();
@@ -885,9 +1837,13 @@
       autoSend: core.config.autoSend,
     });
     adapter.ensureStatusButton();
+    // 身份先行入追踪：后端日志/附件目录按 caller 隔离，排查时需用它对齐
+    core.trace('identity', 'caller=' + core.ensureCallerId() + ' tab=' + core._tabId +
+      ' backend=' + core.config.backendUrl);
 
     const ok = await core.health();
     if (!ok) {
+      core.trace('health/fail', '后端不可达: ' + core.config.backendUrl);
       adapter.setStatus('⚠️ 本地后端未启动: ' + core.config.backendUrl + '（请先运行 backend/main.py）');
       return;
     }
@@ -896,36 +1852,184 @@
       await core.loadRolecard();
       await core.loadTools();
     } catch (e) {
+      core.trace('rolecard/fail', e && e.message || String(e));
       adapter.setStatus('⚠️ 拉取 role_card 失败: ' + e.message);
       return;
     }
 
+    core.trace('ready', 'tools=' + core.config.tools.length + ' autoInject=' + core.config.autoInject +
+      ' autoSend=' + core.config.autoSend);
     adapter.setStatus('✅ 已连接本地后端，' + core.config.tools.length + ' 个工具可用');
 
     if (core.config.autoInject) {
       const okInject = await adapter.injectRolecard(core.config.rolecard);
+      core.trace('inject', okInject ? 'role_card 已注入并发送' : '注入失败（未找到输入框/发送按钮）');
       if (okInject) adapter.setStatus('📝 已注入 role_card，可直接开始对话');
       else adapter.setStatus('❌ role_card 注入失败（未找到输入框/发送按钮），请刷新页面重试');
     }
 
+    let domTicks = 0;   // DOM 通道高频触发，追踪按采样记录（命中工具调用时无条件记录）
     adapter.onModelReply(function (text) {
       // fetch/XHR 通道：完整回复 → 保存到本地文件 + 工具调用检测（解析失败可提示）
+      core.trace('reply/fetch', 'len=' + (text || '').length +
+        ' hasToolCalls=' + core.hasToolCalls(text));
       core.saveReply(text, 'assistant');
       checkCalls(text, true);
     }, function (domText) {
       // DOM 通道：仅工具调用检测（流式中间态，不保存、不提示）
+      domTicks += 1;
+      const hit = core.hasToolCalls(domText);
+      if (hit || domTicks % 20 === 1) {
+        core.trace('reply/dom', 'len=' + (domText || '').length + ' hasToolCalls=' + hit +
+          (hit ? '' : '（采样第 ' + domTicks + ' 次）'));
+      }
       checkCalls(domText, false);
     });
 
+    // ---- 会话切换保护 ----
+    // 站点多为 SPA：切会话不触发脚本重载，而旧会话的历史 @@tool 文本可能仍残留在 DOM 中，
+    // 被 DOM 通道重新检测到 → 当作新调用重复执行（写入/终端类重复执行即是事故）。
+    // 冷却期内丢弃一切检测结果，并清空本轮累积状态，避免跨会话串扰。
+    let lastHref = location.href;
+    function onSessionChange() {
+      // URL 未变则不是会话切换：站点初始化时的 pushState/replaceState 不应触发冷却，
+      // 否则首次进入就被冷却，第一次工具调用会被无谓吞掉。
+      if (location.href === lastHref) return;
+      lastHref = location.href;
+      const cooldown = core.config.sessionSwitchCooldownMs || 5000;
+      suppressUntil = Date.now() + cooldown;
+      // pendingCalls 刻意不清空：冷却只是「延后执行」，清空就等于丢弃用户已发出的调用
+      // 旧会话未回填的结果文本丢弃（后端已落盘附件，数据不丢），避免污染新会话上下文
+      turnResults = [];
+      turnAttachments = [];
+      turnExternalized = [];
+      // 批去重记录必须重置：否则新会话里首次发出的、与旧会话恰好相同的只读调用
+      // 会被 30s 去重窗口吞掉，表现为「一切换会话，工具就莫名其妙不执行了」
+      lastProcessed = null;
+      if (debounceTimer) { clearTimeout(debounceTimer); debounceTimer = null; }
+      if (quiesceTimer) { clearTimeout(quiesceTimer); quiesceTimer = null; }
+      // 冷却期必须保证队列仍留有「触发者」：若只清定时器而不重排，后续重复检测会因去重
+      // 命中（added===0）直接 return，pendingCalls 就再也没人执行，调用永久卡死。
+      if (pendingCalls.length && !busy) {
+        debounceTimer = setTimeout(flushPending, Math.max(600, cooldown));
+      }
+      core.trace('session/switch', '已切换会话，冷却 ' + cooldown + 'ms → ' + location.href);
+    }
+
+    // hash 路由 SPA（如 MiMo 的 #/）：切换会话不会触发脚本重载，
+    // 需在新会话就绪后重新注入 role_card（injectRolecard 内含去重检查，天然幂等）
+    window.addEventListener('hashchange', function () {
+      onSessionChange();
+      if (!core.config.autoInject) return;
+      // 连续切会话会叠加多次注入（2s 延迟内再切一次就有两次），必须先取消上一次未触发的
+      if (rolecardTimer) clearTimeout(rolecardTimer);
+      rolecardTimer = setTimeout(function () {
+        rolecardTimer = null;
+        adapter.injectRolecard(core.config.rolecard);
+      }, 2000);
+    });
+    window.addEventListener('popstate', onSessionChange);
+    // path 路由 SPA（如 DeepSeek）切会话走 history.pushState —— 它不触发 popstate，
+    // 因此必须劫持才能捕获；replaceState 同理。仅包装转发，不改变站点行为。
+    // 劫持属于增强能力，绝不能成为 init 的单点故障：失败只降级为「捕获不到 pushState 切换」
+    // （hashchange/popstate 仍生效），绝不让整个桥接初始化崩掉。
+    try {
+      const _pushState = history.pushState;
+      const _replaceState = history.replaceState;
+      history.pushState = function () {
+        const r = _pushState.apply(this, arguments);
+        onSessionChange();
+        return r;
+      };
+      history.replaceState = function () {
+        const r = _replaceState.apply(this, arguments);
+        onSessionChange();
+        return r;
+      };
+    } catch (e) {
+      core.trace('session/hook-fail', 'history 劫持失败，已降级: ' + ((e && e.message) || e));
+    }
+
     function checkCalls(text, notify) {
-      if (!core.hasToolCalls(text)) return;
-      const calls = core.parseToolCalls(text);
-      if (!calls.length) {
-        // 完整文本解析失败 → 提示（模型格式错误，避免"无反应"困惑）；流式中间态不提示
-        if (notify) adapter.setStatus('⚠️ 模型输出的工具调用格式有误（JSON 引号未转义），请让它重试');
+      // 会话切换冷却中：照常解析入队，执行由 flushPending 延后到冷却结束。
+      // 绝不在此处丢弃 —— href 变化并不等同于切会话（URL 规范化、新建会话回写 id 都会改
+      // href），一旦误冷却又丢弃，用户这次调用就永久消失了（DOM 通道有指纹去重，之后不会
+      // 再被重新检测）。「延迟执行」的代价远小于「丢失调用」。
+      if (!core.hasToolCalls(text)) {
+        // 未命中：多数是正常聊天文本，也可能是模型格式偏差。
+        // 后者表现为"模型明明写了调用却毫无反应"，必须自证，否则排查只能靠猜。
+        // 只在完整回复通道诊断（DOM 流式中间态会频繁误报）。
+        if (notify) diagnoseNearMiss(text);
         return;
       }
+      const calls = core.parseToolCalls(text);
+      if (!calls.length) {
+        // 命中 @@tool 行但拿不到可执行的调用（JSON 解析失败 / 工具名不在清单）
+        if (notify) {
+          core.trace('parse/none', '命中 @@tool 行但没有可执行的调用');
+          // 留存现场：解析失败也要把这行原样存进面板，用户才能在手动执行框里改参数重试
+          const raw = core.extractCommandLines(text) || String(text).slice(0, 4000);
+          core.saveLastCommand(raw, { source: 'auto', invalid: true, reason: '调用行解析失败或工具名不在清单' });
+          autoRepair('调用行解析失败，或工具名不在工具清单内', text);
+        }
+        return;
+      }
+      core.trace('parse/ok', 'matched=' + calls.length + ' [' +
+        calls.map(function (c) { return c.name; }).join(', ') + ']');
+      // 命令记忆：一解析出调用即落存（此时尚未执行，之后无论成败都保留这条，便于手动兜底）
+      core.saveLastCommand(core.callsToText(calls), { source: 'auto', count: calls.length });
       queueCalls(calls);
+    }
+
+    // 近似命中诊断：文本里疑似有工具调用却未被识别 → 记录片段并触发自动纠错。
+    // 常见偏差：@@tool 未独占行首、沿用已弃用的 start:{...}end、把调用写进 ```json 代码块。
+    function diagnoseNearMiss(text) {
+      if (!text) return;
+      const s = String(text);
+      let idx = -1, reason = '';
+      if (/@@tool/i.test(s)) {
+        idx = s.search(/@@tool/i);
+        reason = '@@tool 未独占行首（行首不能有其他文字）';
+      } else if (/start\s*:\s*\{/.test(s)) {
+        idx = s.search(/start\s*:\s*\{/);
+        reason = '使用了已弃用的旧协议 start:{...}end';
+      } else if (/```(?:json)?[ \t]*\r?\n\s*\{\s*"name"\s*:/i.test(s)) {
+        idx = s.search(/```(?:json)?/i);
+        reason = '代码块里的 JSON 缺少 @@tool 行首标记';
+      }
+      if (idx < 0) return;
+      const snippet = s.slice(Math.max(0, idx - 40), idx + 240).replace(/\s+/g, ' ');
+      core.trace('MISMATCH/未触发', reason + ' → 片段: ' + snippet);
+      // 留存现场：格式偏差时把原文里的 @@tool 行（或片段）存入面板手动执行框，供人工修正重发
+      core.saveLastCommand(core.extractCommandLines(s) || s.slice(idx, idx + 4000),
+        { source: 'auto', invalid: true, reason: reason });
+      autoRepair(reason, snippet);
+    }
+
+    // 自动纠错（加固 3）：格式不符时不再只是提示，而是把「正确格式 + 重试指令」直接填回
+    // 输入框；autoSend 开启时一并发送，让链路自动收敛，无需人工介入。
+    function autoRepair(reason, snippet) {
+      if (!core.config.autoRepair) {
+        adapter.setCallState('warning');   // 圆点：橙色（格式待修正）
+        adapter.setStatus('⚠️ 工具调用未识别（' + reason + '），详见面板「调用追踪」');
+        return;
+      }
+      const hint = '⚠️ 上一轮的工具调用未被识别：' + reason + '。\n' +
+        '请严格按下面格式重新输出（每条一行，行首 @@tool，参数单行 JSON，' +
+        '不要代码块包裹，不要任何终止符）：\n\n' +
+        '@@tool read_file {"path":"C:/完整/路径/文件.txt"}\n\n' +
+        '现在，请只输出你要调用的工具（可多行，不要其他内容）。';
+      core.trace('autoRepair', '已生成纠错提示: ' + reason +
+        (snippet ? ' | 片段: ' + String(snippet).slice(0, 160) : ''));
+      adapter.setCallState('warning');   // 圆点：橙色（已生成纠错提示，待发送）
+      adapter.fillInput(hint, 'repair');
+      if (core.config.autoSend) {
+        adapter.autoSend().then(function (sent) {
+          core.trace('autoRepair/send', sent ? '已自动发送' : '发送失败');
+        });
+      } else {
+        adapter.setStatus('⚠️ 调用未识别，已生成纠错提示，请按发送键让模型重发');
+      }
     }
 
     // 累积调用 + 防抖合并（修复"多调用只有第一个回填"的 bug）：
@@ -935,80 +2039,240 @@
     // 重复检测同一调用不会重复入队），流式静止 600ms 后整批执行；执行期间新到达的
     // 调用继续累积，当前批次结束自动续跑，既不丢调用也不重复执行。
     function queueCalls(calls) {
-      let added = false;
+      let added = 0;
       for (const c of calls) {
         const key = JSON.stringify([c.name, c.arguments]);
         if (pendingCalls.some(function (p) { return JSON.stringify([p.name, p.arguments]) === key; })) continue;
         pendingCalls.push(c);
-        added = true;
+        added += 1;
       }
-      if (!added) return;
+      if (!added) {
+        // 去重命中：若队列非空却没有任何待触发的定时器（例如刚被会话切换清掉），
+        // 必须兜底重排 —— 否则这批调用会永远卡在队列里，用户只看到「没反应」
+        if (pendingCalls.length && !busy && !debounceTimer) {
+          debounceTimer = setTimeout(flushPending, 600);
+          core.trace('queue/revive', '队列无触发者，已兜底重排 pending=' + pendingCalls.length);
+        }
+        return;
+      }
+      core.trace('queue', 'new=' + added + ' dup=' + (calls.length - added) +
+        ' pending=' + pendingCalls.length + ' → 600ms 后批量执行');
       if (debounceTimer) clearTimeout(debounceTimer);
       debounceTimer = setTimeout(flushPending, 600);
     }
 
     async function flushPending() {
       if (busy || !pendingCalls.length) return;
+      // 会话切换冷却中：既不执行也不丢弃，延后到冷却结束后再来。
+      // 冷却的用意是避开切会话瞬间 DOM 尚未稳定的窗口，而不是取消用户的调用。
+      if (Date.now() < suppressUntil) {
+        if (debounceTimer) clearTimeout(debounceTimer);
+        const wait = Math.max(200, suppressUntil - Date.now());
+        core.trace('session/defer', '冷却中，延后 ' + wait + 'ms 执行 ' +
+          pendingCalls.length + ' 个调用');
+        debounceTimer = setTimeout(flushPending, wait);
+        return;
+      }
       busy = true;
       try {
         const calls = pendingCalls;
         pendingCalls = [];
-        const key = JSON.stringify(calls.map(function (c) { return [c.name, c.arguments]; }));
-        // 去重防重复执行：仅 30 秒内的相同整批调用算重复（跨会话/用户重试的同内容调用不受影响）
-        const now = Date.now();
-        if (lastProcessed && lastProcessed.key === key && now - lastProcessed.ts < 30000) return;
-        lastProcessed = { key: key, ts: now };
+        // 幂等批 30s 去重：仅当整批全部为幂等（只读）工具时生效——避免把“修正参数后的
+        // 写入/终端重试”当重复吞掉；同流内字面重复仍由 queueCalls 的按调用去重兜底。
+        const allIdempotent = calls.length > 0 &&
+          calls.every(function (c) { return core.isIdempotentTool(c.name); });
+        if (allIdempotent) {
+          const key = JSON.stringify(calls.map(function (c) { return [c.name, c.arguments]; }));
+          const now = Date.now();
+          if (lastProcessed && lastProcessed.key === key && now - lastProcessed.ts < 30000) {
+            core.trace('dedupe', '30s 内相同的只读调用，已去重跳过 [' +
+              calls.map(function (c) { return c.name; }).join(', ') + ']');
+            adapter.setStatus('🔁 检测到 30s 内已执行过的相同只读调用，已去重跳过');
+            return;
+          }
+          lastProcessed = { key: key, ts: now };
+        }
+        core.trace('batch/start', 'n=' + calls.length + ' [' +
+          calls.map(function (c) { return c.name; }).join(', ') + ']');
         await handleToolCalls(calls);
       } finally {
         busy = false;
-        // 批次执行期间新累积的调用继续处理（不丢失）
+        // 批次执行期间新累积的调用继续处理（不丢失）；全部完成 → 静默后统一回填结束本轮
         if (pendingCalls.length) setTimeout(flushPending, 300);
+        else scheduleFinalize();
+      }
+    }
+
+    function scheduleFinalize() {
+      if (quiesceTimer) clearTimeout(quiesceTimer);
+      // 原硬编码 600ms 偏短：模型流式输出的间隔可能更长，会把一批调用拆成多次回填
+      quiesceTimer = setTimeout(finalizeTurn, core.config.batchQuiesceMs || 1500);
+    }
+
+    // 本轮结束：把累计的多批结果合并成一条文本回填（fillInput 用新轮次 token 先清残留再写入，
+    // 保证上下文干净），autoSend 开启时自动发送，否则提示用户按发送键。
+    async function finalizeTurn() {
+      if (quiesceTimer) { clearTimeout(quiesceTimer); quiesceTimer = null; }
+      if (busy || pendingCalls.length || !turnResults.length) return;
+      const text = turnResults.join('\n\n') + FORMAT_HINT;
+      turnResults = [];
+      const files = turnAttachments.slice();
+      turnAttachments = [];
+      const externals = turnExternalized.slice();
+      turnExternalized = [];
+      // 大结果提示（用户侧）：完整内容已在本地附件里，网页输入框点「附件/📎」上传即可取全文，
+      // 既避免超长回填被站点截断，也省掉「模型 read_file 全文」的一轮往返。
+      const attachNote = externals.length
+        ? '📎 本轮有 ' + externals.length + ' 个大结果已存为附件；如需完整内容，' +
+          '请在输入框点「附件/📎」上传该文件：\n' + externals.slice(-3).join('\n')
+        : '';
+      turnSeq += 1;
+      try {
+        core.trace('fill/start', 'chars=' + text.length + ' turn=' + turnSeq +
+          (externals.length ? ' externalized=' + externals.length : ''));
+        const filled = await adapter.fillInput(text, turnSeq);
+        core.trace('fill/done', filled ? '已写入输入框' : '失败：未找到输入框');
+        if (!filled) {
+          // 回填失败（未找到输入框 / 页面结构变更）：结果不丢——后端已落盘附件，直接给路径
+          adapter.setCallState('error');   // 圆点：红色
+          core.trace('fill/fallback', '结果回落附件，本轮 ' + files.length + ' 个附件');
+          adapter.setStatus('❌ 回填失败（未找到输入框）。结果已存入附件:\n' +
+            (files.length ? files.slice(-3).join('\n')
+              : '见后端 data/attachments/<caller>/<日期>/calls_<日期>.jsonl'));
+        } else if (core.config.autoSend) {
+          // 回填后给站点留出解析输入框内容的时间，再触发发送（避免内容未就绪就提交）
+          const delay = core.config.autoSendDelayMs || 1000;
+          if (delay > 0) await new Promise(function (r) { setTimeout(r, delay); });
+          const sent = await adapter.autoSend();
+          core.trace('autosend', sent ? '已提交' : '提交失败');
+          if (sent) {
+            adapter.setCallState('connected');   // 圆点：绿色
+            if (attachNote) adapter.setStatus(attachNote);   // 有附件提示时不静默关闭
+            else adapter.closeStatus();                      // 成功：自动关闭提示
+          } else {
+            adapter.setCallState('error');
+            adapter.setStatus('⚠️ 自动发送失败，请手动按发送键提交');
+          }
+        } else {
+          // 结果已填入输入框：圆点转绿，提示用户按发送键（有大结果附件时追加附件上传提示）
+          adapter.setCallState('connected');
+          adapter.setStatus('📤 工具结果已就绪，请按发送键提交' + (attachNote ? '\n' + attachNote : ''));
+        }
+      } catch (e) {
+        core.trace('fill/error', (e && e.message) ? e.message : String(e));
+        adapter.setStatus('❌ 工具结果回填异常: ' + (e && e.message ? e.message : e));
       }
     }
   }
 
+  // 执行一批调用并把结果文本累积进 turnResults（不在批内逐批回填，统一在 turn 结束时合并）
   async function handleToolCalls(calls) {
-    adapter.setStatus('🔧 正在执行 ' + calls.length + ' 个工具调用...');
+    // 只读结果缓存（优化调用次数）：幂等工具同参数 20s 内直接复用上次结果，
+    // 省掉一次后端往返与一轮模型等待。TTL 短于后端 30s 幂等去重，后端去重仍是第二道防线。
+    const cached = [];
+    const toRun = [];
+    for (const c of calls) {
+      if (core.isIdempotentTool(c.name)) {
+        const hit = core.getCachedResult(c.name, c.arguments);
+        if (hit) { cached.push(Object.assign({}, hit, { _cached: true })); continue; }
+      }
+      toRun.push(c);
+    }
+    if (cached.length) {
+      core.trace('cache/hit', cached.length + ' 个只读调用命中 20s 缓存，未打后端 [' +
+        cached.map(function (r) { return r.tool; }).join(', ') + ']');
+    }
+    adapter.setCallState('busy');   // 圆点：蓝色呼吸
+    adapter.setStatus('🔧 正在执行 ' + (toRun.length + cached.length) + ' 个工具调用...');
+
+    if (!toRun.length) {
+      // 全部命中缓存：无需请求，直接渲染结果
+      turnResults.push(core.formatResults(cached));
+      collectFiles(cached);
+      collectExternalized(cached);
+      core.markLastCommandResult(true, '');   // 缓存命中同样视为执行成功
+      return;
+    }
+
     try {
-      const resp = await core.callTools(calls);
+      core.trace('call/send', 'POST /api/bridge/call n=' + toRun.length);
+      const resp = await core.callToolsWithRetry(toRun);
       const results = (resp && resp.results) || [];
-      // 外置结果自动补全（伪附件）：externalized 结果拉取完整内容内联回填，
-      // 模型直接看到完整内容（等效附件），无需再调 read_file 读外置文件
-      const enriched = await enrichExternalized(results);
-      const formatted = core.formatResults(enriched);
-      // 填入输入框（占位符），autoSend 开启时自动点击发送
-      const filled = await adapter.fillInput(formatted);
-      if (!filled) {
-        adapter.setStatus('❌ 工具结果回填失败: 未找到输入框');
-      } else if (core.config.autoSend) {
-        const sent = await adapter.autoSend();
-        if (sent) adapter.closeStatus();          // 成功：自动关闭提示
-        else adapter.setStatus('⚠️ 自动发送失败，请手动按发送键提交');
-      } else {
-        // 结果已填入输入框：显示短暂指引（3.5s 自动关闭），提醒用户按发送键
-        adapter.setStatus('📤 工具结果已就绪，请按发送键提交');
+      // 逐调用信封摘要：tool#request_id:status，可与后端 /api/bridge/tool_logs、附件目录直接对齐
+      core.trace('call/recv', results.map(function (r) {
+        return (r && (r.tool + '#' + r.request_id + ':' + r.status)) || 'null';
+      }).join(' | ') || '(空结果)');
+      // 只缓存成功结果——错误必须真实重试，不能被缓存掩盖
+      for (const r of results) {
+        if (r && r.status === 'ok' && core.isIdempotentTool(r.tool)) {
+          core.cacheResult(r.tool, r.arguments, r);
+        }
+      }
+      const list = cached.concat(results);
+      // 大结果自动内联是高级开关（默认关：回填预览 + 附件路径，提示用户上传附件取全文）
+      const rendered = core.config.autoEnrichExternalized
+        ? await enrichExternalized(list) : list;
+      turnResults.push(core.formatResults(rendered));
+      collectFiles(results);
+      collectExternalized(rendered);   // 用渲染后的列表判定，已内联(_enriched)的不再提示上传
+      const failed = results.some(function (r) {
+        return r && (r.status === 'error' || r.approval_required);
+      });
+      // 命令记忆回填执行结果：失败时面板提示会显示「执行失败」，用户一眼知道该接手哪一条
+      core.markLastCommandResult(!failed, failed ? '存在失败/待审批的调用' : '');
+      if (results.some(function (r) { return r && r.approval_required; })) {
+        adapter.setCallState('warning');   // 圆点：橙色（待人工处理）
+        adapter.setStatus('⏸ 部分调用需人工审批：请在审批控制台批准后，重发原提示让模型重试' +
+          '\n原命令已存入面板「手动执行」，可修改后直接重试');
       }
     } catch (e) {
-      adapter.setStatus('❌ 工具执行失败: ' + (e && e.message ? e.message : e));
+      // 兜底：即使整批失败也产出一条结果文本回填，满足“任何输出（含错误）都必须返回”
+      adapter.setCallState('error');   // 圆点：红色
+      core.trace('call/error', (e && e.message) ? e.message : String(e));
+      core.markLastCommandResult(false, (e && e.message) ? e.message : String(e));
+      turnResults.push('❌ 工具执行失败: ' + (e && e.message ? e.message : e) +
+        '。请检查后端与调用参数后重试该调用。');
+      // 自动执行失败 → 明确告诉用户去面板手动重试（命令已自动填入，改完点「执行」即可）
+      adapter.setStatus('❌ 工具执行失败：' + (e && e.message ? e.message : e) +
+        '\n原命令已自动存入面板「手动执行」框，可修改后点「▶ 执行」重试');
     }
   }
 
-  // 外置结果补全：{externalized:true, file:"...result_xxx.json"} → 拉完整内容替换 summary。
-  // 失败时回退原摘要（不影响调用主流程）。
+  // 收集本轮结果落盘的附件路径：回填失败时据此指引用户，保证结果不丢
+  function collectFiles(results) {
+    for (const r of results) {
+      if (r && r.file) turnAttachments.push(r.file);
+    }
+  }
+
+  // 收集本轮「大结果」附件（仅 truncated 且未内联）：据此提示用户在网页端上传附件取全文。
+  // 小结果是完整回填，无需打扰；已内联（_enriched）的完整内容已在上下文里，也不提示。
+  function collectExternalized(results) {
+    for (const r of results) {
+      if (r && r.truncated && r.file && !r._enriched && turnExternalized.indexOf(r.file) < 0) {
+        turnExternalized.push(r.file);
+      }
+    }
+  }
+
+  // 外置结果补全（高级开关 autoEnrichExternalized）：
+  // 按 caller+request_id 拉取附件文件全文替换预览。失败时回退原预览（不影响主流程）。
   async function enrichExternalized(results) {
     const out = [];
     for (const r of results) {
-      if (r && r.externalized && r.file) {
+      if (r && r.externalized && r.file && r.request_id) {
         try {
-          const name = String(r.file).split(/[\/]/).pop();
-          const res = await core.request(core.config.backendUrl + '/api/bridge/files/' + encodeURIComponent(name));
+          const q = 'caller_id=' + encodeURIComponent(r.caller_id || 'anon') +
+            '&request_id=' + encodeURIComponent(r.request_id);
+          const res = await core.request(core.config.backendUrl + '/api/bridge/attachments?' + q);
           const content = res && res.data && res.data.content;
           if (content) {
-            out.push(Object.assign({}, r, { summary: content }));
+            // _enriched 标记：已内联全文，_formatOneResult 据此不再提示「上传附件」
+            out.push(Object.assign({}, r, { summary: content, _enriched: true }));
             continue;
           }
         } catch (e) {
-          console.warn('[bridge] 外置结果补全失败，回退摘要: ' + (e && e.message ? e.message : e));
+          console.warn('[bridge] 外置结果补全失败，回退预览: ' + (e && e.message ? e.message : e));
         }
       }
       out.push(r);

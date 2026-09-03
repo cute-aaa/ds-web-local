@@ -27,7 +27,7 @@ MCP 双角色工具聚合中心：
 
 ## 桥接层（bridge/）
 
-- `core.js`：站点无关引擎（拉 role_card、解析 `start:{...}end`、调用后端、回填结果、状态提示）。
+- `core.js`：站点无关引擎（拉 role_card、按行锚定解析 `@@tool` 调用、调用后端、回填结果、状态提示）。
 - `adapters/`：站点适配器（每个 web 端一个，实现契约 D 的 6 个方法）。
 - `build.py`：把 core + 适配器合并为单文件 `ds-bridge.user.js`。
 
