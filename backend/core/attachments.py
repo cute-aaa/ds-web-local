@@ -1,6 +1,6 @@
 """工具结果附件落盘：data/attachments/<caller_id>/<date>/result_<request_id>.json
 
-设计（docs/tool-call-reliability-spec.md §2.3）：
+设计：
 - 每次工具调用（无论大小/成败）默认生成一个附件文件，内容为该调用的完整信封 JSON
   （含完整 result / error / approval 信息），供模型用 read_file 读取全量、供审计回溯。
 - 目录按 caller + 本地日期分层，杜绝跨 profile 混放、便于按保留策略清理。

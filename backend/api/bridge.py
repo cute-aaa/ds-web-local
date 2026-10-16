@@ -185,7 +185,7 @@ async def get_tools():
 
 @router.post("/call")
 async def call(body: BridgeCallBody):
-    """单/多工具调用 → 逐调用全量信封（契约见 docs/tool-call-reliability-spec.md §2.2）。
+    """单/多工具调用 → 逐调用全量信封（契约见 docs/contracts.md）。
 
     变更要点（P0）：
     - 语义性失败（未知工具/参数错/执行异常）放入信封 status="error"，不再 HTTP 500；

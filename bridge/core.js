@@ -31,7 +31,7 @@
       callTotalTimeoutMs: 30000,
     },
 
-    // ---- 调用方身份（多 profile 场景，docs/tool-call-reliability-spec.md §2.1）----
+    // ---- 调用方身份（多 profile 场景）----
     // caller_id 按浏览器 profile 持久化（GM 存储，profile 内恒定）；tab_id 每页加载随机。
     // 后端按 caller 隔离 ask_user/附件/工具日志归属。
     _callerId: '',

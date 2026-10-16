@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""双 profile 人工验收脚本 —— 规格 docs/tool-call-reliability-spec.md §5.3
+"""双 profile 人工验收脚本 —— 桥接可靠性（逐调用信封 / 附件归属 / ask_user 隔离）
 
 背景
 ----
@@ -360,7 +360,7 @@ def main():
     args = ap.parse_args()
 
     print("=" * 72)
-    print("DS Web Local · 桥接可靠性验收（docs/tool-call-reliability-spec.md §5.3）")
+    print("DS Web Local · 桥接可靠性验收")
     print(("模式: 真实后端 " + args.base_url) if args.base_url else "模式: 进程内 TestClient（免启动后端）")
     print("=" * 72)
 
@@ -380,8 +380,7 @@ def main():
         print(f"  {ref}: {ok}/{len(sub)} 通过")
     print(f"\n  总计: {n_pass}/{len(RESULTS)} 通过, {n_fail} 失败")
     print(MANUAL_CHECKLIST)
-    print("（自动项通过 ≠ 验收完成：请按上面手动清单在真实双 profile 中逐项勾选，")
-    print("  并在 docs/tool-call-reliability-spec.md §5.3/§5.4 记录结果或偏差。）")
+    print("（自动项通过 ≠ 验收完成：请按上面手动清单在真实双 profile 中逐项勾选，"))
     sys.exit(1 if n_fail else 0)
 
 

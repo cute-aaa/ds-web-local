@@ -1,6 +1,6 @@
 """ask_user 人类确认工具：发起挂起请求，等待用户经桥接层确认框应答。
 
-归属隔离（docs/tool-call-reliability-spec.md §2.4）：
+归属隔离：
 - caller_id（浏览器 profile 级）：由 api.bridge 在 /call 处理期间写入 CALLER_CTX，
   沿 async 调用链自动传播；查询可按 caller_id 过滤；跨 profile 代答返回 403。
 - tab_id（标签页级）：同一 profile 可开多个标签、各自是独立会话。挂起记录同时记 tab_id，

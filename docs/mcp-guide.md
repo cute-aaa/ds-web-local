@@ -8,7 +8,7 @@
 
 ## 方式二：直接改配置
 
-编辑 `backend/config/mcp.json`：
+编辑 `backend/config/mcp.json`（不入库；首次启动会从 `backend/config/mcp.example.json` 自动生成）：
 
 ```json
 {

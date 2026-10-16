@@ -33,5 +33,13 @@ scripts/probe-out/
 # 探测器默认浏览器/登录态目录（含 Cookie，绝不入库）
 .chrome-test/
 
+# 运行时配置：首次启动由 *.example.json / rolecard/template.md 自动生成，运行时会写回
+backend/config/mcp.json
+backend/config/skills.json
+backend/config/rolecard.md
+
+# 内部设计文档：保留在本地，不随仓库发布
+docs/tool-call-reliability-spec.md
+
 *.tsbuildinfo
 .pytest_cache/

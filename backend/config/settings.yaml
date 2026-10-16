@@ -36,7 +36,7 @@ security:
   approval_enabled: false
   approval_required_tools: ["terminal_run"]
 
-# 桥接可靠性 / 工具结果附件（docs/tool-call-reliability-spec.md §2.3）
+# 桥接可靠性 / 工具结果附件
 # 每次工具调用默认落盘 data/attachments/<caller_id>/<date>/result_<request_id>.json，
 # 以下策略控制服务端清理：启动时 + 每 24h 触发 sweep_attachments()
 bridge:

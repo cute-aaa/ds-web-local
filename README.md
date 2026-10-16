@@ -40,10 +40,6 @@
 | 桥接层 | `bridge/` | 网页版桥接（站点无关引擎 `BridgeCore` + 共享 UI 层 `BridgeUI` + 站点适配器），`build.py` 打包 user.js |
 | 管理控制台 | `console/` | React SPA（Vite + Tailwind），构建产物由后端静态托管 |
 
-## 界面预览
-
-![管理控制台](docs/screenshot-console.png)
-
 ## 快速开始
 
 > 非开发者/第一次接触？先看 [用户指南（图文步骤）](docs/USER_GUIDE.md)。
@@ -101,7 +97,8 @@ python main.py
 
 ### 4. 配置 MCP 服务
 
-编辑 `backend/config/mcp.json` 添加服务（或控制台「MCP 服务」页操作）：
+编辑 `backend/config/mcp.json` 添加服务（或控制台「MCP 服务」页操作）。
+该文件不入库，首次启动会从 `backend/config/mcp.example.json` 自动生成：
 
 ```json
 {

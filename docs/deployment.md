@@ -33,9 +33,12 @@ docker compose up --build
 ## 环境变量 / 配置
 
 - `backend/config/settings.yaml`：日志、并发、健康、超时、认证、技能目录、监听线程
-- `backend/config/mcp.json`：MCP 服务器
-- `backend/config/skills.json`：legacy 技能（新技能走 SKILL.md 目录）
+- `backend/config/mcp.json`：MCP 服务器。**不入库**，首次启动从 `mcp.example.json` 自动生成
+- `backend/config/skills.json`：legacy 技能（新技能走 SKILL.md 目录）。**不入库**，首次启动从 `skills.example.json` 生成
 - `.env.example`：可选（LLM 双模式、认证 token）
+
+> 运行时配置（`mcp.json` / `skills.json` / `rolecard.md`）会被程序写回或按需生成，故默认不纳入版本控制；
+> 仓库只保留 `*.example.json` 模板与 `rolecard/template.md`，首次启动自动补齐。
 
 ## 配置/数据外部化（多机共用）
 
@@ -51,7 +54,7 @@ setx DSW_DATA_DIR   "G:\MyShare\ds-web-local\data"     # user-skills / sessions.
 python backend\main.py
 ```
 
-- 配置目录缺失时自动创建空配置（等价默认）。
+- 配置目录缺失时自动从 `*.example.json` 播种 `mcp.json` / `skills.json`（等价默认），已有配置绝不覆盖。
 - 技能目录 `skills.skills_dirs` 支持**绝对路径**任意位置（source 标记为 `custom`），
   例如网盘上的 SKILL.md 技能库：`skills_dirs: ["skills", "data/user-skills", "G:/MyShare/skills-lib"]`。
 - 注意：`.credentials.yaml` 含明文凭据，共享目录需保证访问权限（建议仅本机可读或加密盘）。

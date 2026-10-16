@@ -49,7 +49,7 @@ POST /api/bridge/call
 - **每次调用默认落盘附件**（完整信封 JSON，含完整结果/错误详情），模型用 `read_file(file)` 读全量。
 - 浏览器把信封渲染为「工具调用结果」消息回填（含 request_id + 原始命令回显），一次调用 = 一次必有返回。
 
-> 本契约的详细设计、去重与多 profile 隔离规则见 `docs/tool-call-reliability-spec.md`。
+> 去重与多 profile 隔离规则见 `docs/bridge-guide.md` 与 `docs/architecture.md`。
 
 ## 契约 B —— 后端 ⇄ 管理控制台
 

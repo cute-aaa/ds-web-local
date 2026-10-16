@@ -26,6 +26,10 @@ LOG_DIR = BASE_DIR / "logs"
 # 环境变量插值完整模式：${VAR} 或 ${VAR:-default}（仅整串匹配才替换）
 _ENV_PATTERN = re.compile(r"^\$\{([A-Za-z_][A-Za-z0-9_]*)(?::-([^}]*))?\}$")
 
+# 运行时会写回 / 本地私有的配置：默认不入库，首次启动从同名 .example.json 模板复制。
+# 动机：控制台改 MCP 服务、导入技能会写回这两个文件，若入库则本地运行配置会不断污染仓库。
+_RUNTIME_CONFIG_FILES = ("mcp.json", "skills.json")
+
 
 class ConfigLoader:
     def __init__(self, config_dir: Optional[Path] = None):
@@ -36,7 +40,28 @@ class ConfigLoader:
         self._server: Dict[str, Any] = {}
         self._skills: Dict[str, Any] = {}
         self._mtime: Dict[str, float] = {}
+        self._seed_runtime_configs()
         self._load_all()
+
+    def _seed_runtime_configs(self) -> None:
+        """运行时配置缺失时从 .example.json 模板复制一份（仓库只保留模板）。
+
+        模板查找顺序：外部配置目录内（DSW_CONFIG_DIR）→ 内置 backend/config/。
+        已存在则绝不覆盖——用户改过的本地配置优先级最高。
+        """
+        for name in _RUNTIME_CONFIG_FILES:
+            dest = self.config_dir / name
+            if dest.exists():
+                continue
+            stem = name[:-5] if name.endswith(".json") else name
+            for src in (self.config_dir / f"{stem}.example.json",
+                        BASE_DIR / "config" / f"{stem}.example.json"):
+                try:
+                    if src.exists() and src.resolve() != dest.resolve():
+                        dest.write_bytes(src.read_bytes())
+                        break
+                except Exception:
+                    continue
 
     def _interpolate_env(self, value: Any) -> Any:
         """递归替换字符串值中的 ${VAR} / ${VAR:-default}（仅整串匹配）。"""

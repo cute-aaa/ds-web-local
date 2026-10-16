@@ -14,5 +14,11 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 _TEST_CFG = tempfile.mkdtemp(prefix="dsw-test-cfg-")
 _TEST_DATA = tempfile.mkdtemp(prefix="dsw-test-data-")
+# 预置空配置文件：ConfigLoader 首次运行会从 *.example.json 生成默认配置（含 windows-mcp），
+# 这里显式写成空，避免测试隔离目录被播种出真实 MCP 服务。
+with open(os.path.join(_TEST_CFG, "mcp.json"), "w", encoding="utf-8") as _f:
+    _f.write('{"services": {}}')
+with open(os.path.join(_TEST_CFG, "skills.json"), "w", encoding="utf-8") as _f:
+    _f.write("{}")
 os.environ["DSW_CONFIG_DIR"] = _TEST_CFG
 os.environ["DSW_DATA_DIR"] = _TEST_DATA

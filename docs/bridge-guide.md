@@ -59,7 +59,7 @@
   失败结果也不进缓存（错误必须真实重试）。
 - 大结果是否自动拉取全量内联由配置 `autoEnrichExternalized` 控制（默认关）。
 
-后端侧本协议的完整设计见 `docs/tool-call-reliability-spec.md`。
+后端侧本协议的完整设计见 `docs/contracts.md` 与 `docs/architecture.md`。
 
 ## 配置
 
@@ -135,7 +135,7 @@
 | 文件 | 作用 |
 | --- | --- |
 | `backend/rolecard/template.md` | 内置默认模板（随代码发布，**不要直接改**） |
-| `backend/config/rolecard.md` | 用户副本，**改这个**；首次运行自动生成 |
+| `backend/config/rolecard.md` | 用户副本，**改这个**；首次运行自动生成、不入库（仓库只保留 template） |
 
 - **改完即生效**：按文件 mtime 热重载，无需重启后端、无需改 JS、无需重新打包油猴脚本。
 - **占位符**：`<!--TOOLS-->` 替换为可用工具清单，`<!--SKILLS-->` 替换为技能说明，**不要删除**。
